@@ -111,22 +111,68 @@ def check_buyability(domain: str):
     return results, can_buy
 
 
-def format_buyability_html(results, can_buy):
-    """Tạo HTML badge tổng. Chỉ hiện registrar BỊ CẤM, không hiện registrar được phép."""
-    if can_buy:
-        overall = "<span class='badge badge-success'>CÓ THỂ MUA</span>"
-    else:
-        overall = "<span class='badge badge-danger'>KHÔNG MUA ĐƯỢC</span>"
+def is_cf_blocked(cf_html: str) -> bool:
+    """True nếu CF banned / chặn add / TLD bị CF cấm → không nên mua."""
+    if not cf_html:
+        return False
+    s = cf_html.lower()
+    return (
+        "banned" in s
+        or "chặn add" in s
+        or "đuôi tld bị cf cấm" in s
+        or "bị cf chặn" in s
+    )
 
-    banned = []
+
+def format_buyability_html(results, tld_ok, is_registered=False, is_restricted=False, cf_blocked=False, cf_html=""):
+    """
+    Trạng thái mua cuối cùng — hiển thị trực quan cho SEOer:
+    - Đã đăng ký           → ĐÃ ĐĂNG KÝ
+    - Restricted            → KHÔNG MUA ĐƯỢC (Registry Policy)
+    - CF Banned / TLD cấm   → KHÔNG MUA ĐƯỢC + lý do rõ ràng
+    - Chưa ĐK + TLD OK      → CÓ THỂ MUA
+    """
+    if is_registered:
+        return "<span class='badge badge-muted'>ĐÃ ĐĂNG KÝ</span>"
+
+    if is_restricted:
+        return (
+            "<span class='badge badge-danger'>KHÔNG MUA ĐƯỢC</span>"
+            "<div class='buy-reason'>⛔ Bị Registry Policy cấm đăng ký</div>"
+        )
+
+    banned_regs = []
     for name, info in results.items():
         if not info["ok"]:
-            banned.append(
-                f"<span class='badge badge-danger' title='{info['reason']}'>{name} ✗</span>"
-            )
-    if banned:
-        return overall + "<br><div class='buy-detail'>" + " ".join(banned) + "</div>"
-    return overall
+            reason = info["reason"] or "TLD bị cấm"
+            banned_regs.append(f"<span class='ban-tag' title='{reason}'>{name}</span>")
+
+    cf_line = ""
+    if cf_blocked:
+        cf_detail = "Cloudflare Banned / TLD bị CF cấm"
+        if cf_html:
+            if "BANNED" in cf_html:
+                cf_detail = "Cloudflare BANNED"
+            elif "Đuôi TLD bị CF cấm" in cf_html:
+                cf_detail = "Đuôi TLD bị Cloudflare cấm"
+            elif "Chặn Add" in cf_html:
+                cf_detail = "Cloudflare chặn thêm domain"
+        cf_line = f"<div class='buy-reason'>⛔ {cf_detail}</div>"
+
+    can_buy = tld_ok and (not cf_blocked)
+
+    if can_buy:
+        return "<span class='badge badge-success'>CÓ THỂ MUA</span>"
+
+    # KHÔNG MUA ĐƯỢC — liệt kê rõ nơi cấm
+    parts = ["<span class='badge badge-danger'>KHÔNG MUA ĐƯỢC</span>"]
+    if banned_regs:
+        parts.append(
+            "<div class='buy-reason'>⛔ Cấm tại: " + " ".join(banned_regs) + "</div>"
+        )
+    if cf_line:
+        parts.append(cf_line)
+    return "".join(parts)
 
 
 # ==========================================
@@ -460,6 +506,8 @@ def get_domain_info(domain):
             "<span class='badge badge-warning'>Restricted by Registry Policy</span>",
             "Registry Policy",
             None,
+            True,   # is_registered (restricted = không available)
+            True,   # is_restricted
         )
 
     if not is_registered:
@@ -467,11 +515,13 @@ def get_domain_info(domain):
             "<span class='badge badge-success'>Chưa đăng ký</span>",
             "<span class='badge badge-success'>Chưa đăng ký</span>",
             None,
+            False,  # is_registered
+            False,  # is_restricted
         )
 
     final_status = format_status_display(status_found)
     final_registrar = registrar if registrar else "Không xác định"
-    return final_status, final_registrar, created
+    return final_status, final_registrar, created, True, False
 
 
 # ==========================================
@@ -758,6 +808,41 @@ HTML_TEMPLATE = """
             gap: 4px;
         }
         .buy-detail .badge { font-size: 10.5px; padding: 2px 8px; }
+        .buy-reason {
+            margin-top: 5px;
+            font-size: 11.5px;
+            color: #f87171;
+            line-height: 1.5;
+        }
+        .ban-tag {
+            display: inline-block;
+            background: rgba(239, 68, 68, 0.18);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 6px;
+            padding: 1px 7px;
+            font-size: 11px;
+            font-weight: 600;
+            margin: 1px 2px;
+        }
+        .note-box {
+            background: rgba(245, 158, 11, 0.08);
+            border: 1px solid rgba(245, 158, 11, 0.25);
+            border-radius: var(--radius-sm);
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            font-size: 13px;
+            color: #fbbf24;
+            line-height: 1.55;
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+        }
+        .note-box .note-icon {
+            flex-shrink: 0;
+            font-size: 16px;
+            margin-top: 1px;
+        }
         /* Table */
         .table-card {
             background: var(--bg-card);
@@ -942,6 +1027,15 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- Important note -->
+        <div class="note-box">
+            <span class="note-icon">⚠️</span>
+            <div>
+                <strong>Lưu ý quan trọng:</strong>
+                Đây là thông tin tham khảo, có thể mua được hay không còn tùy thuộc vào thời điểm và quy định riêng của từng nhà cung cấp.
+            </div>
+        </div>
+
         <!-- Rules summary -->
         <div class="rules-card">
             <h3>◈ Tiêu chí cấm mua theo Registrar</h3>
@@ -998,11 +1092,15 @@ HTML_TEMPLATE = """
                     <div class="legend-rows">
                         <div class="legend-row" data-key="canBuy">
                             <span class="badge badge-success">CÓ THỂ MUA</span>
-                            <span>Ít nhất 1 registrar cho phép</span>
+                            <span>Chưa đăng ký · registrar cho phép</span>
                         </div>
                         <div class="legend-row" data-key="cannotBuy">
                             <span class="badge badge-danger">KHÔNG MUA ĐƯỢC</span>
-                            <span>Tất cả registrar đều cấm</span>
+                            <span>TLD cấm registrar · CF Banned · Registry Policy</span>
+                        </div>
+                        <div class="legend-row" data-key="daDK">
+                            <span class="badge badge-muted">ĐÃ ĐĂNG KÝ</span>
+                            <span>Domain đã có chủ · không mua được</span>
                         </div>
                     </div>
                 </div>
@@ -1177,7 +1275,9 @@ HTML_TEMPLATE = """
 
         function collectLegendKeysFromResult(data, options) {
             if (options.check_buy && data.buy_html) {
-                if (data.can_buy) seenLegendKeys.add("canBuy");
+                const bh = data.buy_html;
+                if (bh.includes("CÓ THỂ MUA")) seenLegendKeys.add("canBuy");
+                else if (bh.includes("ĐÃ ĐĂNG KÝ")) seenLegendKeys.add("daDK");
                 else seenLegendKeys.add("cannotBuy");
             }
             if (options.check_hold && data.status) {
@@ -1219,7 +1319,7 @@ HTML_TEMPLATE = """
                 const row = document.querySelector(`.legend-row[data-key="${key}"]`);
                 if (row) {
                     row.classList.add("show");
-                    if (["canBuy","cannotBuy"].includes(key)) hasBuy = true;
+                    if (["canBuy","cannotBuy","daDK"].includes(key)) hasBuy = true;
                     else if (["active","serverHold","clientHold","transferLock","pendingTransfer","updateLock","redemption","chuaDK","restricted"].includes(key)) hasDomain = true;
                     else hasCf = true;
                 }
@@ -1372,21 +1472,20 @@ def api_check():
         created = None
         cf_add_status = "Bỏ qua"
         buy_html = "Bỏ qua"
-        can_buy = True
+        can_buy = False
+        is_registered = False
+        is_restricted = False
 
-        # Luôn check buyability (nhanh, local)
-        if options.get('check_buy', True):
-            results, can_buy = check_buyability(domain)
-            buy_html = format_buyability_html(results, can_buy)
-
+        # WHOIS trước — cần biết đã ĐK hay chưa để quyết định "có thể mua"
         need_whois = (
-            options.get('check_registrar', True)
+            options.get('check_buy', True)
+            or options.get('check_registrar', True)
             or options.get('check_hold', True)
             or options.get('check_dates', True)
         )
 
         if need_whois:
-            status, registrar, created = get_domain_info(domain)
+            status, registrar, created, is_registered, is_restricted = get_domain_info(domain)
             if not options.get('check_registrar', True):
                 registrar = "Bỏ qua"
             if not options.get('check_hold', True):
@@ -1394,14 +1493,38 @@ def api_check():
             if not options.get('check_dates', True):
                 created = None
 
-        if options.get('check_cf', True):
+        # CF: cần check khi bật cột CF hoặc khi check buy (CF banned → không mua)
+        need_cf = options.get('check_cf', True) or options.get('check_buy', True)
+        if need_cf:
             cf_add_status = check_cf_eligibility(domain)
+            if not options.get('check_cf', True):
+                # Vẫn check CF nội bộ cho buy, nhưng không hiện cột nếu user tắt
+                pass
+
+        cf_blocked = is_cf_blocked(cf_add_status)
+
+        # Buyability: CÓ THỂ MUA chỉ khi CHƯA ĐK + TLD OK + không bị CF banned
+        if options.get('check_buy', True):
+            results, tld_ok = check_buyability(domain)
+            can_buy = (
+                (not is_registered)
+                and (not is_restricted)
+                and tld_ok
+                and (not cf_blocked)
+            )
+            buy_html = format_buyability_html(
+                results, tld_ok,
+                is_registered=is_registered,
+                is_restricted=is_restricted,
+                cf_blocked=cf_blocked,
+                cf_html=cf_add_status,
+            )
 
         return jsonify({
             "domain": domain,
             "buy_html": buy_html,
             "can_buy": can_buy,
-            "cf_add_status": cf_add_status,
+            "cf_add_status": cf_add_status if options.get('check_cf', True) else "Bỏ qua",
             "registrar": registrar,
             "status": status,
             "created": created
