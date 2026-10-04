@@ -2,12 +2,17 @@ services:
   - type: web
     name: domain-buy-checker
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    # 1 worker + nhiều thread: bộ đếm rate-limit nằm trong RAM nên không chia nhiều worker
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120 --access-logfile -
+    healthCheckPath: /healthz
     envVars:
+      - key: SECRET_KEY
+        generateValue: true      # Render tự sinh 1 lần và giữ cố định
+      - key: APP_USERS
+        sync: false              # nhập tay: user1:hash1;user2:hash2
       - key: CF_API_TOKEN
         sync: false
       - key: CF_ACCOUNT_ID
         sync: false
-      - key: PYTHON_VERSION
-        value: "3.11.0"
