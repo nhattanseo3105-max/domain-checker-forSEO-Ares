@@ -315,7 +315,6 @@ def format_buyability_html(results, tld_ok, state, cf=None):
                 + "<div class='buy-reason'>Lỗi kiểm tra Cloudflare — bấm Retry lỗi</div>")
 
     banned = [(n, i["reason"] or "TLD bị cấm") for n, i in results.items() if not i["ok"]]
-    allowed = [n for n, i in results.items() if i["ok"]]
     ban_tags = " ".join(
         f"<span class='ban-tag' title='{html.escape(reason, quote=True)}'>{html.escape(name)}</span>"
         for name, reason in banned
@@ -325,11 +324,7 @@ def format_buyability_html(results, tld_ok, state, cf=None):
     if tld_ok and not cf_blocked:
         out = [_badge("badge-success", "CÓ THỂ MUA")]
         if banned:
-            ok_tags = " ".join(_badge("badge-success", html.escape(n)) for n in allowed)
-            out.append(f"<div class='buy-detail'><span class='skipped'>Mua được tại:</span> {ok_tags}</div>")
             out.append(f"<div class='buy-reason'>⛔ Cấm tại: {ban_tags}</div>")
-        else:
-            out.append("<div class='buy-detail'><span class='skipped'>Mọi registrar đều cho phép</span></div>")
         return "".join(out)
 
     out = [_badge("badge-danger", "KHÔNG MUA ĐƯỢC")]
