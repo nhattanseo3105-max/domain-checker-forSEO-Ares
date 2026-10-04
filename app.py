@@ -557,6 +557,79 @@ def _whois_lookup(domain, timeout):
     return "data", (status, registrar, created, expires)
 
 
+# ---------- bổ sung: retry HTTP, RDAP chính thức của TLD (IANA bootstrap), DNS ----------
+def _http_get(url, timeout=(4, 8), tries=2, **kw):
+    """GET có retry khi timeout / 429 / 5xx. Trả về Response hoặc None nếu mọi lần đều lỗi."""
+    last = None
+    headers = kw.pop("headers", HTTP_HEADERS)
+    for i in range(tries):
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers, **kw)
+            if r.status_code in (429, 500, 502, 503, 504) and i < tries - 1:
+                time.sleep(0.8 * (i + 1))
+                continue
+            return r
+        except requests.RequestException as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(0.5)
+    if last:
+        log.info("GET %s lỗi: %s", url.split("/")[2], last)
+    return None
+
+
+_IANA_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+_IANA_TTL = 24 * 3600
+_bootstrap = {"map": None, "ts": 0.0, "fail_ts": -1e9}
+_bootstrap_lock = threading.Lock()
+
+
+def _rdap_base_for(domain):
+    """URL RDAP chính thức của TLD (lấy từ IANA, cache 24h).
+    Trả về: URL | "" nếu TLD không có RDAP | None nếu chưa tải được bootstrap."""
+    now = time.monotonic()
+    with _bootstrap_lock:
+        stale = _bootstrap["map"] is None or now - _bootstrap["ts"] > _IANA_TTL
+        if stale and now - _bootstrap["fail_ts"] > 60:
+            data = _fetch_json(_IANA_BOOTSTRAP_URL, timeout=(4, 8))
+            mapping = {}
+            try:
+                for tlds, urls in (data or {}).get("services", []):
+                    https = [u for u in urls if u.startswith("https://")] or urls
+                    for t in tlds:
+                        mapping[t.lower()] = https[0]
+            except (TypeError, ValueError, IndexError):
+                mapping = {}
+            if mapping:
+                _bootstrap.update(map=mapping, ts=now)
+            else:
+                _bootstrap["fail_ts"] = now
+        mapping = _bootstrap["map"]
+    if mapping is None:
+        return None
+    return mapping.get(domain.rsplit(".", 1)[-1].lower(), "")
+
+
+def _dns_ns_check(domain, timeout=4):
+    """Hỏi NS qua DNS-over-HTTPS. Trả về "exists" | "nxdomain" | "nodata" | None (không hỏi được)."""
+    for url in ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"):
+        r = _http_get(url, timeout=(timeout, timeout), tries=1,
+                      params={"name": domain, "type": "NS"},
+                      headers={**HTTP_HEADERS, "Accept": "application/dns-json"})
+        if r is None or r.status_code != 200:
+            continue
+        try:
+            j = r.json()
+        except ValueError:
+            continue
+        if j.get("Status") == 3:
+            return "nxdomain"
+        if j.get("Status") == 0:
+            has_ns = any(a.get("type") == 2 for a in (j.get("Answer") or []))
+            return "exists" if has_ns else "nodata"
+    return None
+
+
 def _unregistered_info():
     ok = _badge("badge-success", "Chưa đăng ký")
     return {"state": "unregistered", "status_html": ok, "registrar": ok, "created": None, "expires": None}
@@ -567,7 +640,7 @@ def get_domain_info(domain):
     Trả về dict: state ∈ {registered, unregistered, restricted, unknown}, status_html, registrar, created, expires.
 
     - registered   : có registrar HOẶC ngày đăng ký (bằng chứng chắc chắn)
-    - unregistered : RDAP 404 / nguồn trả rỗng VÀ whois xác nhận "no match"
+    - unregistered : RDAP 404 / nguồn trả rỗng VÀ whois xác nhận "no match" (hoặc RDAP 404 + DNS NXDOMAIN)
     - restricted   : RDAP 404 kèm nội dung Registry Policy
     - unknown      : mọi nguồn lỗi / không đủ bằng chứng → KHÔNG được coi là "chưa đăng ký"
     """
@@ -585,23 +658,39 @@ def get_domain_info(domain):
         created = created or cr
         expires = expires or exp
 
-    # ---- 1. rdap.org ----
-    try:
-        r = requests.get(f"https://rdap.org/domain/{domain}", timeout=(4, 8), headers=HTTP_HEADERS)
+    # ---- 1. RDAP: server chính thức của TLD (IANA) → fallback rdap.org ----
+    base = _rdap_base_for(domain)
+    no_rdap_tld = base == ""
+    rdap_urls = []
+    if base:
+        rdap_urls.append(base.rstrip("/") + "/domain/" + domain)
+    if not no_rdap_tld:
+        rdap_urls.append(f"https://rdap.org/domain/{domain}")
+    for url in rdap_urls:
+        if remaining() <= 2:
+            break
+        r = _http_get(url, timeout=(4, min(8, max(2, remaining()))))
+        if r is None:
+            continue
         if r.status_code == 200:
-            merge(_parse_rdap_json(r.json()))
-        elif r.status_code == 404:
+            try:
+                merge(_parse_rdap_json(r.json()))
+            except ValueError:
+                continue
+            break
+        if r.status_code == 404:
             rdap_404 = True
             restricted = _looks_restricted(r)
-        else:
-            log.info("rdap.org %s → HTTP %s", domain, r.status_code)
-    except (requests.RequestException, ValueError) as e:
-        log.info("rdap.org lỗi %s: %s", domain, e)
+            break
+        log.info("RDAP %s %s → HTTP %s", url.split("/")[2], domain, r.status_code)
 
     def need_more():
         return not restricted and not (registrar or created)
 
-    # ---- 2. who-dat / rdap.cloud (chỉ khi rdap.org không cho kết quả & không phải 404) ----
+    # ---- 1b. DNS (nhanh) – bằng chứng phụ ----
+    dns = _dns_ns_check(domain) if need_more() and remaining() > 3 else None
+
+    # ---- 2. who-dat / rdap.cloud (chỉ khi RDAP không cho kết quả & không phải 404) ----
     if need_more() and not rdap_404:
         for url in (f"https://who-dat.as93.net/{domain}", f"https://rdap.cloud/api/v1/{domain}"):
             if remaining() <= 3:
@@ -638,7 +727,18 @@ def get_domain_info(domain):
             "status_html": format_status_display(status),
             "registrar": reg_text, "created": created, "expires": expires,
         }
-    if (rdap_404 or empty_ok) and whois_no_match:
+    # Có NS đang chạy = chắc chắn đã có chủ (dù không lấy được registrar/ngày)
+    if dns == "exists":
+        return {
+            "state": "registered",
+            "status_html": format_status_display(status),
+            "registrar": "Không xác định (có DNS)", "created": None, "expires": None,
+        }
+    # Chưa đăng ký: cần 1 nguồn "không có" + 1 nguồn xác nhận.
+    # NXDOMAIN một mình KHÔNG đủ (domain bị clientHold cũng NXDOMAIN) → chỉ dùng kèm RDAP 404 chính thức.
+    if whois_no_match and (rdap_404 or empty_ok or no_rdap_tld):
+        return _unregistered_info()
+    if rdap_404 and dns == "nxdomain":
         return _unregistered_info()
     return {
         "state": "unknown",
