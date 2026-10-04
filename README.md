@@ -2,6 +2,9 @@
 
 Công cụ nội bộ giúp đội SEO **lọc nhanh domain nào mua được, mua ở đâu và có rủi ro gì** trước khi chi tiền. Nhập danh sách domain, hệ thống trả về kết luận cho từng domain chỉ sau vài giây.
 
+🌐 **Trang đã triển khai:** [https://domain-checker-forseo-ares.onrender.com](https://domain-checker-forseo-ares.onrender.com)
+*(cần tài khoản để đăng nhập, liên hệ quản trị viên để được cấp)*
+
 > 🎯 **Mục tiêu:** giảm thời gian kiểm tra thủ công, tránh mua nhầm domain đã có chủ, bị registrar cấm hoặc bị Cloudflare chặn.
 
 ---
