@@ -52,22 +52,28 @@ def check_buyability(domain: str):
     results = {}
 
     # ---------- Namecheap ----------
+    # Cấm: .ch .li .cn .au .fr .ca .eu .eco
+    # .uk: CHỈ cấm .uk thuần (example.uk). Mọi dạng *.xx.uk (.co.uk, .org.uk, .me.uk...) ĐƯỢC PHÉP
+    # .in: cấm nếu domain chứa "india"
     nc_ok = True
     nc_reason = ""
-    # Chỉ cấm .uk thuần (không cấm .co.uk, .org.uk ...)
-    if last_tld == ".uk" and full_suffix == ".uk":
-        nc_ok = False
-        nc_reason = "Cấm đuôi .uk thuần"
-    elif full_suffix in NAMECHEAP_BANNED_TLDS or last_tld in NAMECHEAP_BANNED_TLDS:
-        # Nếu full_suffix là .co.uk thì last_tld=.uk nhưng full != .uk → không cấm
-        if not (last_tld == ".uk" and full_suffix != ".uk"):
+
+    if last_tld == ".uk":
+        # Chỉ cấm khi đúng là domain.uk (không có cấp 2)
+        if full_suffix == ".uk":
             nc_ok = False
-            nc_reason = f"Cấm đuôi {full_suffix if full_suffix in NAMECHEAP_BANNED_TLDS else last_tld}"
-    # .in chứa "india"
+            nc_reason = "Cấm đuôi .uk thuần"
+        # else: .co.uk / .org.uk / .me.uk / ... → được phép, bỏ qua
+    elif full_suffix in NAMECHEAP_BANNED_TLDS or last_tld in NAMECHEAP_BANNED_TLDS:
+        banned = full_suffix if full_suffix in NAMECHEAP_BANNED_TLDS else last_tld
+        nc_ok = False
+        nc_reason = f"Cấm đuôi {banned}"
+
     if nc_ok and (last_tld == ".in" or full_suffix.endswith(".in")):
         if "india" in domain:
             nc_ok = False
             nc_reason = 'Domain .in chứa "india"'
+
     results["Namecheap"] = {"ok": nc_ok, "reason": nc_reason}
 
     # ---------- GoDaddy ----------
@@ -936,8 +942,9 @@ HTML_TEMPLATE = """
             <div class="rules-grid">
                 <div class="rule-item">
                     <strong>Namecheap</strong>
-                    <span>Cấm: .ch .li .cn .au .fr .ca .eu .eco · chỉ .uk thuần<br>
-                    Cấm .in chứa "india" · .co.uk được phép</span>
+                    <span>Cấm: .ch .li .cn .au .fr .ca .eu .eco · <b>.uk thuần</b><br>
+                    Mọi *.xx.uk (.co.uk .org.uk…) được phép<br>
+                    Cấm .in chứa "india"</span>
                 </div>
                 <div class="rule-item">
                     <strong>GoDaddy</strong>
