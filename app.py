@@ -1,3 +1,4 @@
+import copy
 import getpass
 import hmac
 import html
@@ -9,22 +10,26 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 
 import requests
 import whois
-
-# Runtime dependency:
-#   pip install pymongo
-# Existing dependencies remain unchanged.
-try:
-    from pymongo import MongoClient
-except ImportError:  # optional at import time; startup will explain dependency
-    MongoClient = None
 from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
+
+try:
+    from pymongo import MongoClient, UpdateOne
+    from pymongo.errors import DuplicateKeyError, PyMongoError
+except ImportError:  # chưa cài pymongo → chỉ dùng được APP_USERS + quy tắc mặc định
+    MongoClient = UpdateOne = None
+
+    class PyMongoError(Exception):
+        pass
+
+    class DuplicateKeyError(PyMongoError):
+        pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("domain-checker")
@@ -55,12 +60,6 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_MIN_INTERVAL = _float_env("CF_MIN_INTERVAL", 0.35)      # giây giữa 2 lần gọi CF (tránh rate limit)
 
-# MongoDB Atlas
-# Khuyến nghị đặt MONGODB_URI trong Environment của Render thay vì hard-code credential.
-MONGODB_URI = os.environ.get("MONGODB_URI", "")
-MONGODB_DB_NAME = os.environ.get("MONGODB_DB_NAME", "domain_buy_checker")
-MONGODB_SERVER_SELECTION_TIMEOUT_MS = _int_env("MONGODB_SERVER_SELECTION_TIMEOUT_MS", 8000)
-
 IS_RENDER = bool(os.environ.get("RENDER"))
 _secret = os.environ.get("SECRET_KEY", "")
 if not _secret:
@@ -74,7 +73,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=IS_RENDER,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=_int_env("SESSION_HOURS", 12)),
-    MAX_CONTENT_LENGTH=64 * 1024,
+    MAX_CONTENT_LENGTH=512 * 1024,
 )
 
 API_LIMIT_PER_MIN = _int_env("API_LIMIT_PER_MIN", 120)     # số lượt /api/check mỗi user mỗi phút
@@ -91,103 +90,8 @@ HTTP_HEADERS = {
 # ==========================================
 # ĐĂNG NHẬP / BẢO MẬT
 # ==========================================
-
-# ==========================================
-# MONGODB: USERS / RULES / HIDDEN DOMAINS
-# ==========================================
-# Collections:
-#   users            {username, password_hash, role, created_at, updated_at}
-#   provider_rules   {provider, banned_tlds[], allowed_tlds[], banned_domain_patterns[]}
-#   hidden_domains   {domain, providers[]}
-#
-# Admin is determined strictly by username == "admin" OR role == "admin".
-# Các user khác không thể gọi các API quản trị vì backend kiểm tra quyền,
-# không chỉ ẩn nút ở frontend.
-
-MONGO_CLIENT = None
-MONGO_DB = None
-MONGO_USERS = None
-MONGO_RULES = None
-MONGO_HIDDEN = None
-
-PROVIDERS = ("Namecheap", "GoDaddy", "Dynadot", "Spaceship", "SAV")
-
-DEFAULT_PROVIDER_RULES = {
-    "Namecheap": {
-        "banned_tlds": [".ch", ".li", ".cn", ".au", ".fr", ".ca", ".eu", ".eco", ".uk"],
-        "allowed_tlds": [],
-        "banned_domain_patterns": [r"^.+\.in$::contains=india"],
-    },
-    "GoDaddy": {
-        "banned_tlds": [".cz", ".eu", ".dk", ".in"],
-        "allowed_tlds": [],
-        "banned_domain_patterns": [],
-    },
-    "Dynadot": {
-        "banned_tlds": [".it", ".org"],
-        "allowed_tlds": [],
-        "banned_domain_patterns": [],
-    },
-    "Spaceship": {
-        "banned_tlds": [".de"],
-        "allowed_tlds": [".uk", ".my"],
-        "banned_domain_patterns": [],
-    },
-    "SAV": {
-        "banned_tlds": [],
-        "allowed_tlds": [],
-        "banned_domain_patterns": [],
-    },
-}
-
-def _mongo_now():
-    return datetime.utcnow()
-
-def _connect_mongodb():
-    global MONGO_CLIENT, MONGO_DB, MONGO_USERS, MONGO_RULES, MONGO_HIDDEN
-    if not MONGODB_URI:
-        log.warning("MONGODB_URI chưa được cấu hình; app sẽ dùng APP_USERS và luật mặc định.")
-        return False
-    if MongoClient is None:
-        log.error("Thiếu package pymongo. Hãy thêm pymongo vào requirements.txt.")
-        return False
-    try:
-        MONGO_CLIENT = MongoClient(
-            MONGODB_URI,
-            serverSelectionTimeoutMS=MONGODB_SERVER_SELECTION_TIMEOUT_MS,
-            connectTimeoutMS=MONGODB_SERVER_SELECTION_TIMEOUT_MS,
-            socketTimeoutMS=MONGODB_SERVER_SELECTION_TIMEOUT_MS,
-            appname="DomainBuyChecker",
-        )
-        MONGO_CLIENT.admin.command("ping")
-        MONGO_DB = MONGO_CLIENT[MONGODB_DB_NAME]
-        MONGO_USERS = MONGO_DB["users"]
-        MONGO_RULES = MONGO_DB["provider_rules"]
-        MONGO_HIDDEN = MONGO_DB["hidden_domains"]
-        MONGO_USERS.create_index("username", unique=True)
-        MONGO_RULES.create_index("provider", unique=True)
-        MONGO_HIDDEN.create_index("domain", unique=True)
-        _seed_default_rules()
-        _sync_env_users()
-        log.info("MongoDB Atlas connected: db=%s", MONGODB_DB_NAME)
-        return True
-    except Exception:
-        log.exception("Không kết nối được MongoDB Atlas.")
-        MONGO_CLIENT = MONGO_DB = MONGO_USERS = MONGO_RULES = MONGO_HIDDEN = None
-        return False
-
-def _seed_default_rules():
-    if MONGO_RULES is None:
-        return
-    for provider, rule in DEFAULT_PROVIDER_RULES.items():
-        if MONGO_RULES.find_one({"provider": provider}) is None:
-            MONGO_RULES.insert_one({
-                "provider": provider,
-                **rule,
-                "updated_at": _mongo_now(),
-            })
-
-def _load_env_users():
+def load_users():
+    """APP_USERS="user1:secret1;user2:secret2"  (secret = hash werkzeug hoặc mật khẩu thường)"""
     users = {}
     for item in os.environ.get("APP_USERS", "").split(";"):
         item = item.strip()
@@ -199,154 +103,353 @@ def _load_env_users():
             users[name] = secret
     return users
 
-def _sync_env_users():
-    if MONGO_USERS is None:
-        return
-    for name, secret in _load_env_users().items():
-        if MONGO_USERS.find_one({"username": name}) is None:
-            stored = secret if secret.startswith(("scrypt:", "pbkdf2:")) else generate_password_hash(secret)
-            MONGO_USERS.insert_one({
-                "username": name,
-                "password_hash": stored,
-                "role": "admin" if name == "admin" else "user",
-                "created_at": _mongo_now(),
-                "updated_at": _mongo_now(),
-            })
 
-def _mongo_user(username):
-    if MONGO_USERS is None:
-        return None
-    return MONGO_USERS.find_one({"username": username})
-
-def _fallback_verify_password(username, password):
-    stored = _load_env_users().get(username)
-    if stored is None:
-        check_password_hash(_DUMMY_HASH, password)
-        return False
-    if stored.startswith(("scrypt:", "pbkdf2:")):
-        return check_password_hash(stored, password)
-    return hmac.compare_digest(stored.encode("utf-8"), password.encode("utf-8"))
-
-def verify_password(username, password):
-    user = _mongo_user(username)
-    if user:
-        stored = str(user.get("password_hash", ""))
-        if stored.startswith(("scrypt:", "pbkdf2:")):
-            return check_password_hash(stored, password)
-        return hmac.compare_digest(stored.encode("utf-8"), password.encode("utf-8"))
-    return _fallback_verify_password(username, password)
-
-def current_user_record():
-    username = session.get("user")
-    if not username:
-        return None
-    user = _mongo_user(username)
-    if user:
-        return user
-    # Fallback APP_USERS users are normal users except literal "admin".
-    if username in _load_env_users():
-        return {"username": username, "role": "admin" if username == "admin" else "user"}
-    return None
-
-def is_admin():
-    user = current_user_record()
-    return bool(user and (user.get("role") == "admin" or user.get("username") == "admin"))
-
-def admin_required(view):
-    @wraps(view)
-    def wrapper(*args, **kwargs):
-        if not session.get("user"):
-            return jsonify(error="unauthorized", failed=True), 401
-        if not is_admin():
-            return jsonify(error="forbidden", failed=True), 403
-        if not _csrf_ok(request.headers.get("X-CSRF-Token", "")):
-            return jsonify(error="csrf", failed=True), 403
-        return view(*args, **kwargs)
-    return wrapper
-
-def _safe_list(value):
-    if not isinstance(value, list):
-        return []
-    return [str(x).strip().lower() for x in value if str(x).strip()]
-
-def get_provider_rules():
-    rules = {}
-    if MONGO_RULES is not None:
-        for provider in PROVIDERS:
-            doc = MONGO_RULES.find_one({"provider": provider}) or {}
-            defaults = DEFAULT_PROVIDER_RULES[provider]
-            rules[provider] = {
-                "banned_tlds": _safe_list(doc.get("banned_tlds", defaults["banned_tlds"])),
-                "allowed_tlds": _safe_list(doc.get("allowed_tlds", defaults["allowed_tlds"])),
-                "banned_domain_patterns": _safe_list(
-                    doc.get("banned_domain_patterns", defaults["banned_domain_patterns"])
-                ),
-            }
-    else:
-        rules = {
-            p: {
-                "banned_tlds": _safe_list(v["banned_tlds"]),
-                "allowed_tlds": _safe_list(v["allowed_tlds"]),
-                "banned_domain_patterns": _safe_list(v["banned_domain_patterns"]),
-            } for p, v in DEFAULT_PROVIDER_RULES.items()
-        }
-    return rules
-
-def get_hidden_domains():
-    if MONGO_HIDDEN is None:
-        return []
-    return list(MONGO_HIDDEN.find({}, {"_id": 0}).sort("domain", 1))
-
-def hidden_domain_provider_blocked(domain, provider):
-    if MONGO_HIDDEN is None:
-        return False
-    doc = MONGO_HIDDEN.find_one({"domain": domain.lower().strip()})
-    if not doc:
-        return False
-    providers = doc.get("providers") or []
-    return provider in providers or "*" in providers
-
-def _normalize_rule_tld(value):
-    value = str(value or "").strip().lower()
-    if not value:
-        return ""
-    return value if value.startswith(".") else "." + value
-
-def update_provider_rule(provider, banned_tlds, allowed_tlds, patterns):
-    if MONGO_RULES is None:
-        raise RuntimeError("MongoDB chưa kết nối")
-    if provider not in PROVIDERS:
-        raise ValueError("Provider không hợp lệ")
-    banned = sorted({_normalize_rule_tld(x) for x in banned_tlds if _normalize_rule_tld(x)})
-    allowed = sorted({_normalize_rule_tld(x) for x in allowed_tlds if _normalize_rule_tld(x)})
-    pats = sorted({str(x).strip().lower() for x in patterns if str(x).strip()})
-    MONGO_RULES.update_one(
-        {"provider": provider},
-        {"$set": {
-            "provider": provider,
-            "banned_tlds": banned,
-            "allowed_tlds": allowed,
-            "banned_domain_patterns": pats,
-            "updated_at": _mongo_now(),
-        }},
-        upsert=True,
-    )
-
-def generate_random_password(length=8):
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-# Khởi tạo Mongo sau khi app config đã sẵn sàng.
-_connect_mongodb()
-
-# Giữ tên biến cũ để các phần khác của code không bị vỡ.
-USERS = _load_env_users()
-if MONGO_USERS is not None:
-    USERS = {d["username"]: d.get("password_hash", "") for d in MONGO_USERS.find({}, {"username": 1, "password_hash": 1})}
+USERS = load_users()
 if not USERS:
-    log.warning("Chưa có user. Hãy tạo admin trong MongoDB hoặc cấu hình APP_USERS.")
+    log.info("APP_USERS chưa được cấu hình → chỉ dùng tài khoản lưu trong MongoDB "
+             "(nếu MongoDB lỗi, app sẽ từ chối mọi truy cập — fail-closed).")
 
 _DUMMY_HASH = generate_password_hash("dummy-password")
+
+
+# ==========================================
+# MONGODB ATLAS  (users · đuôi cấm/cho phép · domain cấm)
+# ==========================================
+# Khuyến nghị: đặt MONGODB_URI trong Environment của Render thay vì để trong code.
+MONGODB_URI = os.environ.get("MONGODB_URI") or (
+    "mongodb+srv://nhattanseo3105_db_user:HeSauzpD4Vn3fbfA@cluster0.lhnikju.mongodb.net/?appName=Cluster0"
+)
+MONGODB_DB = os.environ.get("MONGODB_DB", "domain_checker")
+
+ADMIN_USERNAME = "admin"                      # CHỈ tài khoản tên "admin" mới có quyền quản trị
+DEFAULT_ADMIN_PASSWORD = os.environ.get("ADMIN_DEFAULT_PASSWORD") or "ares#3105"
+
+REGISTRARS = ["Namecheap", "GoDaddy", "Dynadot", "Spaceship", "SAV"]
+
+# Cấu hình mặc định (khớp logic cũ). Admin có thể chỉnh trong tab "Đuôi cấm / cho phép".
+#   banned   : ".uk" = cả đuôi .uk và mọi .xx.uk · ".co.uk" = đúng đuôi đó · "*.uk" = mọi .xx.uk (không gồm .uk thuần)
+#   allowed  : đuôi cho phép đặc biệt (thắng khi cùng mức hoặc cụ thể hơn đuôi bị cấm)
+#   keywords : ".in:india" = đuôi .in mà tên domain chứa "india" thì cấm
+DEFAULT_RULES = {
+    "Namecheap": {
+        "banned": [".ch", ".li", ".cn", ".au", ".fr", ".ca", ".eu", ".eco", ".uk"],
+        "allowed": ["*.uk"],                 # chỉ cấm .uk thuần; .co.uk .org.uk ... được phép
+        "keywords": [".in:india"],
+    },
+    "GoDaddy": {"banned": [".in", ".cz", ".eu", ".dk"], "allowed": [], "keywords": []},   # .in = tất cả .in
+    "Dynadot": {"banned": [".it", ".org"], "allowed": [], "keywords": []},
+    "Spaceship": {"banned": [".de"], "allowed": [".uk", ".my"], "keywords": []},
+    "SAV": {"banned": [], "allowed": [], "keywords": []},
+}
+
+_db_state = {"client": None, "db": None, "fail_ts": -1e9}
+_db_lock = threading.Lock()
+
+
+def _now():
+    return datetime.utcnow()
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if isinstance(dt, datetime) else None
+
+
+def _ensure_schema(db):
+    db.users.create_index("username_lower", unique=True)
+    db.domain_blocks.create_index("domain", unique=True)
+    db.tld_rules.create_index("registrar", unique=True)
+    now = _now()
+    if db.users.find_one({"username_lower": ADMIN_USERNAME}, {"_id": 1}) is None:
+        try:
+            db.users.insert_one({
+                "username": ADMIN_USERNAME, "username_lower": ADMIN_USERNAME,
+                "password_hash": generate_password_hash(DEFAULT_ADMIN_PASSWORD),
+                "pv": secrets.token_hex(4), "default_pw": True,
+                "created_at": now, "updated_at": now, "created_by": "system",
+            })
+            log.warning("Đã tạo tài khoản admin mặc định — hãy đổi mật khẩu sau khi đăng nhập.")
+        except DuplicateKeyError:
+            pass
+    for reg in REGISTRARS:
+        if db.tld_rules.find_one({"registrar": reg}, {"_id": 1}) is None:
+            try:
+                db.tld_rules.insert_one({"registrar": reg, **copy.deepcopy(DEFAULT_RULES[reg]),
+                                         "updated_at": now, "updated_by": "system"})
+            except DuplicateKeyError:
+                pass
+
+
+def get_db():
+    """Trả về database (hoặc None nếu chưa kết nối được; tự thử lại mỗi 20 giây)."""
+    if _db_state["db"] is not None:
+        return _db_state["db"]
+    if MongoClient is None or not MONGODB_URI:
+        return None
+    with _db_lock:
+        if _db_state["db"] is not None:
+            return _db_state["db"]
+        now = time.monotonic()
+        if now - _db_state["fail_ts"] < 20:
+            return None
+        try:
+            client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=6000, connectTimeoutMS=6000,
+                                 appname="domain-checker")
+            client.admin.command("ping")
+            db = client[MONGODB_DB]
+            _ensure_schema(db)
+            _db_state.update(client=client, db=db)
+            log.info("Đã kết nối MongoDB Atlas (db=%s)", MONGODB_DB)
+            return db
+        except Exception as e:  # noqa: BLE001
+            _db_state["fail_ts"] = now
+            log.error("Không kết nối được MongoDB: %s", e)
+            return None
+
+
+# ---------- người dùng ----------
+_user_cache = {}                      # username -> (monotonic_ts, pv)
+_user_cache_lock = threading.Lock()
+USER_CACHE_TTL = 15
+
+
+def _clear_user_cache():
+    with _user_cache_lock:
+        _user_cache.clear()
+
+
+def auth_ready():
+    return bool(USERS) or get_db() is not None
+
+
+def find_user(username):
+    """→ {username, secret, pv, source} | None.  MongoDB trước, rồi APP_USERS (env) làm dự phòng."""
+    name = (username or "").strip()
+    if not name:
+        return None
+    db = get_db()
+    if db is not None:
+        try:
+            doc = db.users.find_one({"username_lower": name.lower()})
+            if doc:
+                return {"username": doc["username"], "secret": doc.get("password_hash", ""),
+                        "pv": doc.get("pv", ""), "source": "db"}
+        except PyMongoError as e:
+            log.error("Lỗi đọc user từ MongoDB: %s", e)
+    secret = USERS.get(name)
+    if secret is not None:
+        return {"username": name, "secret": secret, "pv": "env", "source": "env"}
+    return None
+
+
+def authenticate(username, password):
+    rec = find_user(username)
+    if rec is None:
+        check_password_hash(_DUMMY_HASH, password)   # giữ thời gian xử lý gần như nhau
+        return None
+    stored = rec["secret"]
+    if stored.startswith(("scrypt:", "pbkdf2:")):
+        ok = check_password_hash(stored, password)
+    else:
+        ok = hmac.compare_digest(stored.encode("utf-8"), password.encode("utf-8"))
+    return rec if ok else None
+
+
+def verify_password(username, password):
+    return authenticate(username, password) is not None
+
+
+def _session_user_pv(user):
+    """→ (found, pv); found=None nếu lỗi DB."""
+    err = False
+    db = get_db()
+    if db is not None:
+        try:
+            doc = db.users.find_one({"username": user}, {"pv": 1})
+            if doc:
+                return True, doc.get("pv", "")
+        except PyMongoError as e:
+            log.error("Lỗi kiểm tra phiên: %s", e)
+            err = True
+    if user in USERS:
+        return True, "env"
+    return (None if err else False), None
+
+
+def session_valid():
+    """Phiên còn hiệu lực? (user vẫn tồn tại và chưa bị đổi mật khẩu / xóa bởi admin)"""
+    user = session.get("user")
+    if not user:
+        return False
+    want = session.get("pv", "env")
+    now = time.monotonic()
+    with _user_cache_lock:
+        hit = _user_cache.get(user)
+    if hit and now - hit[0] < USER_CACHE_TTL:
+        return hit[1] == want
+    found, pv = _session_user_pv(user)
+    if found is None:                                  # lỗi DB → dùng cache cũ nếu có
+        return bool(hit) and hit[1] == want
+    with _user_cache_lock:
+        if found:
+            _user_cache[user] = (now, pv)
+        else:
+            _user_cache.pop(user, None)
+    return bool(found) and pv == want
+
+
+def is_admin():
+    return session.get("user") == ADMIN_USERNAME
+
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+
+def _validate_username(name):
+    if not _USERNAME_RE.match(name or ""):
+        return "Tên đăng nhập 3–32 ký tự, chỉ gồm chữ, số, _ . -"
+    if name.lower() == ADMIN_USERNAME:
+        return 'Tên "admin" được dành riêng'
+    return None
+
+
+def _validate_password(pw):
+    if not pw or len(pw) < 6:
+        return "Mật khẩu tối thiểu 6 ký tự"
+    if len(pw) > 128:
+        return "Mật khẩu tối đa 128 ký tự"
+    return None
+
+
+# ---------- cấu hình đuôi cấm / domain cấm (cache có TTL) ----------
+_SUFFIX_RE = re.compile(r"^\*?(?:\.[a-z0-9-]{1,63}){1,3}$")
+_KEYWORD_RE = re.compile(r"^[a-z0-9-]{1,63}$")
+
+
+def _split_tokens(items):
+    if isinstance(items, str):
+        items = [items]
+    out = []
+    for it in items or []:
+        out += [t for t in re.split(r"[\s,;]+", str(it)) if t]
+    return out
+
+
+def normalize_suffix(tok):
+    s = str(tok).strip().lower()
+    wild = s.startswith("*")
+    s = s.lstrip("*").strip(".")
+    if not s:
+        return None
+    s = ("*" if wild else "") + "." + s
+    return s if _SUFFIX_RE.match(s) else None
+
+
+def normalize_keyword(tok):
+    tld, _, kw = str(tok).strip().lower().partition(":")
+    tld = normalize_suffix(tld)
+    kw = kw.strip()
+    if not tld or tld.startswith("*") or not _KEYWORD_RE.match(kw):
+        return None
+    return f"{tld}:{kw}"
+
+
+def _clean_list(items, fn):
+    good, bad = [], []
+    for tok in _split_tokens(items):
+        v = fn(tok)
+        if v is None:
+            bad.append(tok)
+        elif v not in good:
+            good.append(v)
+    return sorted(good), bad
+
+
+def extract_domains(text):
+    out, seen = [], set()
+    for tok in re.split(r"[\s,;|]+", str(text or "").lower()):
+        tok = re.sub(r"^[a-z]+://", "", tok).split("/")[0].split(":")[0]
+        if tok.startswith("www."):
+            tok = tok[4:]
+        tok = tok.rstrip(".")
+        if tok and tok not in seen and DOMAIN_RE.match(tok):
+            seen.add(tok)
+            out.append(tok)
+    return out
+
+
+def _compile_rule(banned, allowed, keywords):
+    kws = []
+    for k in keywords or []:
+        tld, _, kw = str(k).partition(":")
+        if tld and kw:
+            kws.append((tld, kw))
+    return {"banned": set(banned or []), "allowed": set(allowed or []), "keywords": kws}
+
+
+def _rule_to_lists(rule):
+    return {"banned": sorted(rule["banned"]), "allowed": sorted(rule["allowed"]),
+            "keywords": [f"{t}:{k}" for t, k in rule["keywords"]]}
+
+
+def _default_config():
+    return ({r: _compile_rule(**DEFAULT_RULES[r]) for r in REGISTRARS}, {})
+
+
+_cfg = {"ts": -1e9, "rules": None, "blocks": None}
+_cfg_lock = threading.Lock()
+CFG_TTL = 20
+
+
+def _invalidate_config():
+    with _cfg_lock:
+        _cfg["ts"] = -1e9
+
+
+def get_config(force=False):
+    """→ (rules{registrar: rule}, blocks{domain: set(registrars)}) — cache 20s, tự nạp lại khi admin sửa."""
+    now = time.monotonic()
+    with _cfg_lock:
+        if not force and _cfg["rules"] is not None and now - _cfg["ts"] < CFG_TTL:
+            return _cfg["rules"], _cfg["blocks"]
+        db = get_db()
+        if db is None:
+            if _cfg["rules"] is None:
+                _cfg["rules"], _cfg["blocks"] = _default_config()
+            _cfg["ts"] = now - CFG_TTL + 5                       # thử lại sau ~5 giây
+            return _cfg["rules"], _cfg["blocks"]
+        try:
+            rules, _ = _default_config()
+            for doc in db.tld_rules.find({}):
+                reg = doc.get("registrar")
+                if reg in rules:
+                    rules[reg] = _compile_rule(doc.get("banned"), doc.get("allowed"), doc.get("keywords"))
+            blocks = {}
+            for doc in db.domain_blocks.find({}, {"domain": 1, "registrars": 1}):
+                if doc.get("registrars"):
+                    blocks[doc["domain"]] = set(doc["registrars"])
+            _cfg.update(rules=rules, blocks=blocks, ts=now)
+        except PyMongoError as e:
+            log.error("Lỗi nạp cấu hình từ MongoDB: %s", e)
+            if _cfg["rules"] is None:
+                _cfg["rules"], _cfg["blocks"] = _default_config()
+            _cfg["ts"] = now - CFG_TTL + 5
+        return _cfg["rules"], _cfg["blocks"]
+
+
+def rules_summary():
+    rules, _ = get_config()
+    out = []
+    for reg in REGISTRARS:
+        r = rules[reg]
+        lines = []
+        if r["banned"]:
+            lines.append("Cấm: " + " ".join(sorted(r["banned"])))
+        if r["allowed"]:
+            lines.append("Cho phép đặc biệt: " + " ".join(sorted(r["allowed"])))
+        for tld, kw in r["keywords"]:
+            lines.append(f'Cấm {tld} chứa "{kw}"')
+        out.append({"name": reg, "lines": lines or ["Chưa có lưu ý · luôn cho phép"]})
+    return out
 
 
 class RateLimiter:
@@ -381,6 +484,7 @@ class RateLimiter:
 
 login_limiter = RateLimiter()
 api_limiter = RateLimiter()
+admin_limiter = RateLimiter()
 
 
 def _csrf_ok(token):
@@ -393,7 +497,12 @@ def _csrf_ok(token):
 def login_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
-        if "user" not in session or not current_user_record():
+        if not auth_ready():
+            return "Chưa kết nối được MongoDB và chưa cấu hình APP_USERS trên server.", 503
+        if "user" not in session:
+            return redirect(url_for("login"))
+        if not session_valid():                      # user bị xóa / đổi mật khẩu → đăng nhập lại
+            session.clear()
             return redirect(url_for("login"))
         return view(*args, **kwargs)
     return wrapper
@@ -403,13 +512,38 @@ def api_guard(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
         user = session.get("user")
-        if not user or not current_user_record():
+        if not auth_ready() or not user:
+            return jsonify(error="unauthorized", failed=True), 401
+        if not session_valid():
+            session.clear()
             return jsonify(error="unauthorized", failed=True), 401
         if not _csrf_ok(request.headers.get("X-CSRF-Token", "")):
             return jsonify(error="csrf", failed=True), 403
         if api_limiter.blocked(user, API_LIMIT_PER_MIN, 60):
             return jsonify(error="rate_limited", failed=True), 429
         api_limiter.hit(user, 60)
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def admin_guard(view):
+    """Chỉ tài khoản tên "admin" (đã đăng nhập, CSRF hợp lệ) mới gọi được API quản trị."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        user = session.get("user")
+        if not auth_ready() or not user:
+            return jsonify(error="unauthorized"), 401
+        if not session_valid():
+            session.clear()
+            return jsonify(error="unauthorized"), 401
+        if not _csrf_ok(request.headers.get("X-CSRF-Token", "")):
+            return jsonify(error="Phiên không hợp lệ (CSRF) — hãy tải lại trang"), 403
+        if user != ADMIN_USERNAME:
+            return jsonify(error="Chỉ tài khoản admin mới có quyền thực hiện"), 403
+        key = "admin:" + user
+        if admin_limiter.blocked(key, 120, 60):
+            return jsonify(error="Thao tác quá nhanh, thử lại sau"), 429
+        admin_limiter.hit(key, 60)
         return view(*args, **kwargs)
     return wrapper
 
@@ -450,12 +584,8 @@ DOMAIN_RE = re.compile(
 # Spaceship: .de (cho phép .uk .my)
 # SAV:       chưa có lưu ý
 
-# Compatibility aliases. Actual rules are read from MongoDB when available.
-DEFAULT_NAMECHEAP_BANNED_TLDS = set(DEFAULT_PROVIDER_RULES["Namecheap"]["banned_tlds"])
-DEFAULT_GODADDY_BANNED_TLDS = set(DEFAULT_PROVIDER_RULES["GoDaddy"]["banned_tlds"])
-DEFAULT_DYNADOT_BANNED_TLDS = set(DEFAULT_PROVIDER_RULES["Dynadot"]["banned_tlds"])
-DEFAULT_SPACESHIP_BANNED_TLDS = set(DEFAULT_PROVIDER_RULES["Spaceship"]["banned_tlds"])
-
+# Các danh sách trên là cấu hình MẶC ĐỊNH (xem DEFAULT_RULES bên dưới) — admin chỉnh trực tiếp
+# trên website, dữ liệu lưu ở MongoDB.
 
 # Nhãn cấp 2 thường gặp dưới ccTLD (co.uk, org.uk, com.au, co.in, ...)
 SECOND_LEVEL_LABELS = {
@@ -486,46 +616,47 @@ def _match_banned(full_suffix, last_tld, banned):
     return None
 
 
-def _pattern_matches(domain, pattern):
-    """Hỗ trợ pattern regex hoặc pattern đơn giản '::contains=text'."""
-    try:
-        if "::contains=" in pattern:
-            _, needle = pattern.split("::contains=", 1)
-            return needle.strip().lower() in domain.lower()
-        return bool(re.search(pattern, domain, re.IGNORECASE))
-    except re.error:
-        return pattern.lower() in domain.lower()
+def _rule_hit(domain, full_suffix, last_tld, rule):
+    """Trả về lý do bị cấm (chuỗi) hoặc "" nếu được phép.
+    Mức cụ thể hơn thắng: đuôi đầy đủ (.co.uk) → wildcard (*.uk) → đuôi cuối (.uk).
+    Cùng một mức mà có cả cấm lẫn cho phép → cho phép thắng."""
+    order = [full_suffix]
+    if full_suffix != last_tld:
+        order += ["*" + last_tld, last_tld]
+    reason = ""
+    for c in order:
+        if c in rule["allowed"]:
+            break
+        if c in rule["banned"]:
+            if c == last_tld and full_suffix != last_tld:
+                reason = f"Cấm đuôi {c} ({full_suffix})"
+            elif c.startswith("*"):
+                reason = f"Cấm đuôi {full_suffix}"
+            else:
+                reason = f"Cấm đuôi {c}"
+            break
+    if not reason:
+        for tld, kw in rule["keywords"]:
+            if tld in (full_suffix, last_tld) and kw in domain:
+                reason = f'Domain {tld} chứa "{kw}"'
+                break
+    return reason
+
 
 def check_buyability(domain: str):
-    """Trả về ({registrar: {"ok": bool, "reason": str}}, can_buy).
-    Luật mặc định cũ được seed vào MongoDB; admin có thể chỉnh từng provider.
-    """
+    """Trả về ({registrar: {"ok": bool, "reason": str}}, can_buy)
+    can_buy = True nếu có ÍT NHẤT 1 registrar cho phép.
+    Quy tắc lấy từ MongoDB (admin chỉnh được) + danh sách domain cấm riêng của admin."""
     domain = domain.lower().strip()
     full_suffix, last_tld = get_tld_parts(domain)
+    rules, blocks = get_config()
+    blocked_regs = blocks.get(domain, ())
     results = {}
-    rules = get_provider_rules()
-
-    for provider in PROVIDERS:
-        rule = rules.get(provider, {})
-        banned = set(rule.get("banned_tlds") or [])
-        allowed = set(rule.get("allowed_tlds") or [])
-        patterns = rule.get("banned_domain_patterns") or []
-        reason = ""
-
-        # Explicit allowed suffix takes precedence over a broad TLD ban.
-        if full_suffix not in allowed and last_tld not in allowed:
-            hit = _match_banned(full_suffix, last_tld, banned)
-            if hit:
-                reason = f"Cấm đuôi {hit}"
-
-        if not reason:
-            for pattern in patterns:
-                if _pattern_matches(domain, pattern):
-                    reason = f"Cấm theo rule: {pattern}"
-                    break
-
-        results[provider] = {"ok": not reason, "reason": reason}
-
+    for reg in REGISTRARS:
+        reason = _rule_hit(domain, full_suffix, last_tld, rules[reg])
+        if not reason and reg in blocked_regs:
+            reason = "Domain nằm trong danh sách cấm nội bộ"
+        results[reg] = {"ok": not reason, "reason": reason}
     return results, any(r["ok"] for r in results.values())
 
 
@@ -870,6 +1001,21 @@ def _dns_ns_check(domain, timeout=4):
     return None
 
 
+def _rdap_event_date(data, actions):
+    """Ngày (date) mới nhất của sự kiện RDAP có eventAction thuộc `actions`, hoặc None."""
+    best = None
+    for ev in (data.get("events") or []) if isinstance(data, dict) else []:
+        if str(ev.get("eventAction", "")).lower() in actions:
+            m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(ev.get("eventDate", "")))
+            if m:
+                try:
+                    d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    continue
+                best = d if best is None or d > best else best
+    return best
+
+
 def _unregistered_info():
     ok = _badge("badge-success", "Chưa đăng ký")
     return {"state": "unregistered", "status_html": ok, "registrar": ok, "created": None, "expires": None}
@@ -889,6 +1035,7 @@ def get_domain_info(domain):
 
     status, registrar, created, expires = set(), None, None, None
     restricted = rdap_404 = empty_ok = False
+    last_transfer = None
 
     def merge(parsed):
         nonlocal status, registrar, created, expires
@@ -914,7 +1061,9 @@ def get_domain_info(domain):
             continue
         if r.status_code == 200:
             try:
-                merge(_parse_rdap_json(r.json()))
+                rdap_json = r.json()
+                merge(_parse_rdap_json(rdap_json))
+                last_transfer = _rdap_event_date(rdap_json, ("transfer",)) or last_transfer
             except ValueError:
                 continue
             break
@@ -966,6 +1115,7 @@ def get_domain_info(domain):
             "state": "registered",
             "status_html": format_status_display(status),
             "registrar": reg_text, "created": created, "expires": expires,
+            "status_keys": sorted(status), "transferred": last_transfer,
         }
     # Có NS đang chạy = chắc chắn đã có chủ (dù không lấy được registrar/ngày)
     if dns == "exists":
@@ -973,6 +1123,7 @@ def get_domain_info(domain):
             "state": "registered",
             "status_html": format_status_display(status),
             "registrar": "Không xác định (có DNS)", "created": None, "expires": None,
+            "status_keys": sorted(status), "transferred": last_transfer,
         }
     # Chưa đăng ký: cần 1 nguồn "không có" + 1 nguồn xác nhận.
     # NXDOMAIN một mình KHÔNG đủ (domain bị clientHold cũng NXDOMAIN) → chỉ dùng kèm RDAP 404 chính thức.
@@ -1070,6 +1221,93 @@ def check_cf_eligibility(domain):
         log.info("CF trả mã lạ %s cho %s", code, domain)
         return _cf_result(_badge("badge-muted", f"Lỗi CF: {code}"), code)
     return _cf_result(_badge("badge-muted", "Không rõ trạng thái"))
+
+
+# ==========================================
+# 2b. KIỂM TRA ĐỦ ĐIỀU KIỆN TRANSFER
+# ==========================================
+TRANSFER_MIN_DAYS = _int_env("TRANSFER_MIN_DAYS", 60)
+
+_TRANSFER_BLOCKERS = {
+    "clientTransferProhibited": "Đang khóa Transfer tại registrar (clientTransferProhibited) — cần mở khóa",
+    "serverTransferProhibited": "Registry chặn Transfer (serverTransferProhibited)",
+    "pendingTransfer": "Domain đang trong quá trình transfer (pendingTransfer)",
+    "redemptionPeriod": "Domain đang ở Redemption Period",
+    "pendingDelete": "Domain đang Pending Delete",
+    "pendingRestore": "Domain đang Pending Restore",
+    "serverHold": "Domain bị serverHold",
+}
+
+
+def _parse_short_date(s):
+    """'DD/MM/YY' → date (YY ≤ năm hiện tại+1 → 20YY, ngược lại 19YY)"""
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{2})", s or "")
+    if not m:
+        return None
+    d, mo, yy = (int(x) for x in m.groups())
+    year = 2000 + yy if yy <= (datetime.utcnow().year % 100) + 1 else 1900 + yy
+    try:
+        return date(year, mo, d)
+    except ValueError:
+        return None
+
+
+def check_transfer_eligibility(domain):
+    """Đủ điều kiện transfer = đã đăng ký > TRANSFER_MIN_DAYS ngày (và lần transfer gần nhất nếu có)
+    + không bị chặn transfer. Dữ liệu từ WHOIS/RDAP công khai."""
+    info = get_domain_info(domain)
+    state = info["state"]
+    out = {
+        "domain": domain, "eligible": False, "failed": False, "age_days": None, "reasons": [],
+        "registrar": info["registrar"], "status": info["status_html"],
+        "created": info["created"], "expires": info["expires"], "result_html": "",
+    }
+
+    def done(badge_cls, text, reasons=(), ok_note=""):
+        out["reasons"] = list(reasons)
+        parts = [_badge(badge_cls, text)]
+        parts += [f"<div class='buy-reason'>⛔ {html.escape(r)}</div>" for r in reasons]
+        if ok_note:
+            parts.append(f"<div class='buy-reason ok'>{html.escape(ok_note)}</div>")
+        out["result_html"] = "".join(parts)
+        return out
+
+    if state == "unknown":
+        out["failed"] = True
+        return done("badge-warning", "CHƯA XÁC ĐỊNH", ["Không tra cứu được WHOIS/RDAP — bấm Retry lỗi"])
+    if state == "unregistered":
+        return done("badge-muted", "CHƯA ĐĂNG KÝ", ["Domain chưa đăng ký — không có gì để transfer"])
+    if state == "restricted":
+        return done("badge-danger", "KHÔNG THỂ TRANSFER", ["Domain bị Registry Policy cấm đăng ký"])
+
+    today = datetime.utcnow().date()
+    reasons = []
+    created = _parse_short_date(info["created"])
+    if created:
+        age = (today - created).days
+        out["age_days"] = age
+        if age <= TRANSFER_MIN_DAYS:
+            reasons.append(f"Mới đăng ký {age} ngày — cần hơn {TRANSFER_MIN_DAYS} ngày "
+                           f"(còn {TRANSFER_MIN_DAYS + 1 - age} ngày nữa)")
+    transferred = info.get("transferred")
+    if transferred:
+        since = (today - transferred).days
+        if since <= TRANSFER_MIN_DAYS:
+            reasons.append(f"Vừa transfer {since} ngày trước — cần hơn {TRANSFER_MIN_DAYS} ngày kể từ lần transfer gần nhất")
+    keys = set(info.get("status_keys") or [])
+    for key, text in _TRANSFER_BLOCKERS.items():
+        if key in keys:
+            reasons.append(text)
+
+    if reasons:
+        return done("badge-danger", "CHƯA ĐỦ ĐIỀU KIỆN", reasons)
+    if not created:
+        return done("badge-warning", "CHƯA XÁC ĐỊNH",
+                    ["Không lấy được ngày đăng ký nên chưa kiểm tra được mốc 60 ngày "
+                     "(không phát hiện khóa transfer)"])
+    out["eligible"] = True
+    return done("badge-success", "ĐỦ ĐIỀU KIỆN",
+                ok_note=f"✓ Đã đăng ký {out['age_days']} ngày · không bị chặn transfer")
 
 
 # ==========================================
@@ -1561,32 +1799,68 @@ HTML_TEMPLATE = """
             .container { padding: 20px 14px 40px; }
             .delay-box { margin-left: 0; width: 100%; }
         }
-
-        .feature-tabs { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
-        .feature-tab { background:var(--bg-card); color:var(--text-muted); border:1px solid var(--border); padding:10px 14px; border-radius:9px; }
-        .feature-tab.active { background:linear-gradient(135deg,#3b82f6,#2563eb); color:#fff; border-color:#3b82f6; }
-        .feature-panel { min-height: 120px; }
-        .panel-title { font-size:18px; margin-bottom:6px; }
-        .panel-sub { color:var(--text-muted); font-size:13px; margin-bottom:14px; }
-        .link-button { text-decoration:none; }
-        .admin-section-title { font-size:15px; margin-bottom:12px; }
-        .admin-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin-bottom:14px; }
-        .admin-input, .admin-textarea, select.admin-input {
-            width:100%; padding:10px 12px; background:var(--bg); border:1px solid var(--border);
-            border-radius:8px; color:var(--text); font-family:inherit;
-        }
-        .admin-textarea { min-height:110px; resize:vertical; font-family:'JetBrains Mono',monospace; }
-        .provider-checks { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0 14px; }
-        .check-pill { background:var(--bg); border:1px solid var(--border); padding:8px 10px; border-radius:8px; color:var(--text-muted); cursor:pointer; }
-        .check-pill input { width:auto; margin-right:5px; }
-        .admin-list { margin-top:14px; display:flex; flex-direction:column; gap:7px; }
-        .admin-row { display:flex; justify-content:space-between; gap:10px; align-items:center; padding:9px 11px; background:var(--bg); border:1px solid var(--border); border-radius:8px; font-size:12.5px; }
-        .admin-row code { color:#93c5fd; }
-        .admin-row button { padding:6px 9px; font-size:11px; }
-        @media (max-width:780px) { .admin-grid { grid-template-columns:1fr; } }
         .user-box { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-muted); }
         .user-box form { margin: 0; }
         .user-box button { padding: 7px 14px; font-size: 13px; }
+
+        /* ===== Tabs & form (tính năng mới) ===== */
+        .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+        .tab-btn {
+            background: transparent; color: var(--text-muted); border: 1px solid transparent; border-bottom: none;
+            border-radius: 8px 8px 0 0; padding: 10px 16px; font-size: 13.5px; font-weight: 600;
+        }
+        .tab-btn:hover { color: var(--text); background: var(--bg-elevated); }
+        .tab-btn.active { color: #fff; background: var(--bg-card); border-color: var(--border-light); box-shadow: inset 0 2px 0 var(--primary); }
+        .tab-sep { width: 1px; background: var(--border-light); margin: 6px 6px; }
+        .tab-panel { display: none; }
+        .tab-panel.show { display: block; }
+        .field {
+            width: 100%; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border);
+            border-radius: var(--radius-sm); color: var(--text); font-size: 14px; font-family: inherit;
+        }
+        .field:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+        .field-mono { font-family: 'JetBrains Mono', monospace; font-size: 13px; }
+        textarea.field { height: 86px; resize: vertical; }
+        .form-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+        .form-group { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 200px; }
+        .form-group label { font-size: 12.5px; color: var(--text-muted); font-weight: 500; }
+        .inline-row { display: flex; gap: 6px; }
+        .hint { font-size: 12px; color: var(--text-dim); line-height: 1.55; margin-top: 8px; }
+        .section-title { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+        .check-grid { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0 4px; }
+        .check-chip {
+            display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--bg);
+            border: 1px solid var(--border-light); border-radius: 8px; cursor: pointer; font-size: 13.5px; user-select: none;
+        }
+        .check-chip input { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
+        .btn-danger { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; }
+        .btn-sm { padding: 6px 12px; font-size: 12.5px; }
+        .rules-edit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
+        .reg-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+        .reg-card h4 { font-size: 15px; margin-bottom: 12px; }
+        .reg-card .form-group { margin-bottom: 10px; }
+        .msg { font-size: 13px; min-height: 18px; margin-top: 8px; }
+        .msg.ok { color: #4ade80; }
+        .msg.err { color: #f87171; }
+        .buy-reason.ok { color: #4ade80; }
+        .tbl-sm { min-width: 560px; }
+        .tag-x {
+            display: inline-flex; align-items: center; gap: 4px; background: rgba(239, 68, 68, 0.18); color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 1px 4px 1px 8px; font-size: 11.5px;
+            font-weight: 600; margin: 2px;
+        }
+        .tag-x button { background: none; padding: 0 5px; font-size: 14px; color: #fca5a5; line-height: 1.2; border-radius: 4px; }
+        .tag-x button:hover { background: rgba(239, 68, 68, 0.3); }
+        .price-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+        .price-card h3 { font-size: 15px; margin-bottom: 8px; }
+        .price-card p { font-size: 13px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.55; }
+        a.link-btn {
+            display: inline-flex; align-items: center; gap: 6px; padding: 10px 18px; font-size: 14px; font-weight: 600;
+            border-radius: var(--radius-sm); text-decoration: none; color: #fff;
+            background: linear-gradient(135deg, #3b82f6, #2563eb); box-shadow: 0 2px 12px rgba(59, 130, 246, 0.35);
+        }
+        a.link-btn:hover { transform: translateY(-1px); }
+        .user-box .badge { font-size: 10.5px; }
     </style>
 </head>
 <body>
@@ -1601,12 +1875,27 @@ HTML_TEMPLATE = """
             </div>
             <div class="user-box">
                 <span>👤 {{ username }}</span>
+                {% if is_admin %}<span class="badge badge-info">ADMIN</span>{% endif %}
                 <form method="post" action="/logout">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button type="submit" class="btn-secondary">Đăng xuất</button>
                 </form>
             </div>
         </div>
+
+        <div class="tabs" id="tabsBar">
+            <button class="tab-btn active" data-tab="buy">◈ Kiểm tra mua domain</button>
+            <button class="tab-btn" data-tab="transfer">⇄ Kiểm tra Transfer</button>
+            <button class="tab-btn" data-tab="price">$ Kiểm tra giá GoDaddy</button>
+            {% if is_admin %}
+            <span class="tab-sep"></span>
+            <button class="tab-btn" data-tab="rules">⚙ Đuôi cấm / cho phép</button>
+            <button class="tab-btn" data-tab="blocks">🚫 Domain cấm (ẩn)</button>
+            <button class="tab-btn" data-tab="users">👥 Tài khoản</button>
+            {% endif %}
+        </div>
+
+        <div class="tab-panel show" id="tab-buy">
 
         <!-- Important note -->
         <div class="note-box">
@@ -1617,145 +1906,11 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Rules summary -->
+        <!-- Rules summary (tự cập nhật theo cấu hình admin) -->
         <div class="rules-card">
             <h3>◈ Tiêu chí cấm mua theo Registrar</h3>
-            <div class="rules-grid">
-                <div class="rule-item">
-                    <strong>Namecheap</strong>
-                    <span>Cấm: .ch .li .cn .au .fr .ca .eu .eco · <b>.uk thuần</b><br>
-                    Mọi *.xx.uk (.co.uk .org.uk…) được phép<br>
-                    Cấm .in chứa "india"</span>
-                </div>
-                <div class="rule-item">
-                    <strong>GoDaddy</strong>
-                    <span>Cấm: TẤT CẢ .in (kể cả .co.in .net.in…)<br>
-                    Cấm: .cz .eu .dk</span>
-                </div>
-                <div class="rule-item">
-                    <strong>Dynadot</strong>
-                    <span>Cấm: .it · .org</span>
-                </div>
-                <div class="rule-item">
-                    <strong>Spaceship</strong>
-                    <span>Cấm: .de<br>
-                    Cho phép: .uk · .my</span>
-                </div>
-                <div class="rule-item">
-                    <strong>SAV</strong>
-                    <span>Chưa có lưu ý · luôn cho phép</span>
-                </div>
-            </div>
+            <div class="rules-grid" id="rulesGrid"></div>
         </div>
-
-
-        <!-- Feature Tabs -->
-        <div class="feature-tabs">
-            <button class="feature-tab active" onclick="switchFeature('checker', this)">🔎 Kiểm tra Domain</button>
-            <button class="feature-tab" onclick="switchFeature('transfer', this)">↔ Kiểm tra Transfer</button>
-            <button class="feature-tab" onclick="switchFeature('godaddy', this)">💰 Giá GoDaddy</button>
-            {% if is_admin %}
-            <button class="feature-tab" onclick="switchFeature('admin', this)">🛡️ Quản trị Admin</button>
-            {% endif %}
-        </div>
-
-        <div id="feature-transfer" class="feature-panel" style="display:none">
-            <div class="card">
-                <h2 class="panel-title">↔ Kiểm tra điều kiện Transfer</h2>
-                <p class="panel-sub">Kiểm tra domain đã đăng ký đủ hơn 60 ngày và không bị khóa transfer.</p>
-                <textarea id="transferList" placeholder="Mỗi dòng 1 domain&#10;example.com&#10;example.net"></textarea>
-                <div class="action-bar">
-                    <button class="btn-primary" onclick="startTransferCheck()">▶ Kiểm tra Transfer</button>
-                </div>
-                <div class="progress" id="transferProgress">Sẵn sàng kiểm tra</div>
-            </div>
-            <div class="table-card">
-                <div class="table-wrapper">
-                    <table>
-                        <thead><tr><th>Domain</th><th>Ngày đăng ký</th><th>Số ngày</th><th>Transfer Lock</th><th>Kết quả</th></tr></thead>
-                        <tbody id="transferBody"></tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <div id="feature-godaddy" class="feature-panel" style="display:none">
-            <div class="card">
-                <h2 class="panel-title">💰 Kiểm tra giá Domain GoDaddy</h2>
-                <div class="note-box">
-                    <span class="note-icon">⚠️</span>
-                    <div><strong>Lưu ý:</strong> Nếu giá domain rẻ bất thường, vui lòng liên hệ IT mua domain để được hỗ trợ kiểm tra giá.</div>
-                </div>
-                <p class="panel-sub">Chức năng này chỉ dẫn link mở trang GoDaddy, không thực hiện tra cứu trực tiếp trên website GoDaddy.</p>
-                <div class="action-bar">
-                    <a class="btn-primary link-button" href="https://www.godaddy.com/en/domains/bulk-domain-search" target="_blank" rel="noopener noreferrer">🔗 Mở GoDaddy — Giá mua mới</a>
-                    <a class="btn-secondary link-button" href="https://www.godaddy.com/en/domains/domain-transfer" target="_blank" rel="noopener noreferrer">🔗 Mở GoDaddy — Giá Transfer</a>
-                </div>
-            </div>
-        </div>
-
-        {% if is_admin %}
-        <div id="feature-admin" class="feature-panel" style="display:none">
-            <div class="card">
-                <h2 class="panel-title">🛡️ Quản trị Admin</h2>
-                <p class="panel-sub">Chỉ tài khoản <b>admin</b> mới có quyền lưu các thay đổi này.</p>
-            </div>
-
-            <div class="card">
-                <h3 class="admin-section-title">1. Luật đuôi theo nhà cung cấp</h3>
-                <div class="admin-grid">
-                    <div>
-                        <label>Nhà cung cấp</label>
-                        <select id="ruleProvider" class="admin-input" onchange="loadProviderRule()">
-                            {% for p in providers %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
-                        </select>
-                    </div>
-                    <div>
-                        <label>Đuôi bị cấm (mỗi dòng 1 đuôi)</label>
-                        <textarea id="bannedTlds" class="admin-textarea"></textarea>
-                    </div>
-                    <div>
-                        <label>Đuôi cho phép đặc biệt (mỗi dòng 1 đuôi)</label>
-                        <textarea id="allowedTlds" class="admin-textarea"></textarea>
-                    </div>
-                    <div>
-                        <label>Rule domain đặc biệt (regex hoặc <code>::contains=text</code>)</label>
-                        <textarea id="bannedPatterns" class="admin-textarea"></textarea>
-                    </div>
-                </div>
-                <button class="btn-primary" onclick="saveProviderRule()">💾 Lưu luật nhà cung cấp</button>
-            </div>
-
-            <div class="card">
-                <h3 class="admin-section-title">2. Domain ẩn / cấm riêng</h3>
-                <label>Danh sách domain (mỗi dòng 1 domain)</label>
-                <textarea id="hiddenDomainsInput" class="admin-textarea" placeholder="domain1.com&#10;domain2.net"></textarea>
-                <label>Áp dụng cấm trên</label>
-                <div class="provider-checks">
-                    {% for p in providers %}
-                    <label class="check-pill"><input type="checkbox" class="hidden-provider" value="{{ p }}"> {{ p }}</label>
-                    {% endfor %}
-                    <label class="check-pill"><input type="checkbox" id="hiddenAllProviders" value="*"> Tất cả</label>
-                </div>
-                <button class="btn-primary" onclick="addHiddenDomains()">➕ Thêm / cập nhật domain ẩn</button>
-                <div id="hiddenDomainList" class="admin-list"></div>
-            </div>
-
-            <div class="card">
-                <h3 class="admin-section-title">3. Quản lý tài khoản</h3>
-                <div class="admin-grid user-form-grid">
-                    <div><label>Tên user</label><input id="userName" class="admin-input" autocomplete="off"></div>
-                    <div><label>Mật khẩu</label><input id="userPassword" class="admin-input" type="text" autocomplete="new-password"></div>
-                    <div><label>Role</label><select id="userRole" class="admin-input"><option value="user">user</option><option value="admin">admin</option></select></div>
-                </div>
-                <div class="action-bar">
-                    <button class="btn-secondary" onclick="generateAdminPassword()">🎲 Tạo pass ngẫu nhiên 8 ký tự</button>
-                    <button class="btn-primary" onclick="saveAdminUser()">💾 Tạo / sửa user</button>
-                </div>
-                <div id="userList" class="admin-list"></div>
-            </div>
-        </div>
-        {% endif %}
 
         <!-- Input -->
         <div class="card">
@@ -1886,6 +2041,139 @@ HTML_TEMPLATE = """
                 </table>
             </div>
         </div>
+        </div><!-- /tab-buy -->
+
+        <!-- ================= TAB: KIỂM TRA TRANSFER ================= -->
+        <div class="tab-panel" id="tab-transfer">
+            <div class="note-box">
+                <span class="note-icon">ℹ️</span>
+                <div>
+                    <strong>Điều kiện đủ transfer:</strong> domain đã đăng ký <b>hơn 60 ngày</b> (và hơn 60 ngày kể từ lần transfer gần nhất nếu có)
+                    và <b>không bị chặn transfer</b> (clientTransferProhibited, serverTransferProhibited, pendingTransfer, Redemption / Pending Delete, serverHold).
+                    Dữ liệu lấy từ WHOIS/RDAP công khai nên chỉ mang tính tham khảo; một số ccTLD có quy định riêng và khi chuyển vẫn cần mã Auth/EPP từ registrar hiện tại.
+                </div>
+            </div>
+            <div class="card">
+                <textarea id="tfList" placeholder="Nhập domain cần kiểm tra transfer (mỗi dòng 1 domain)&#10;example.com&#10;example.net"></textarea>
+                <div class="action-bar">
+                    <button id="btnTf" class="btn-primary" onclick="startTransfer(false)">▶ Kiểm tra Transfer</button>
+                    <button id="btnTfRetry" class="btn-warning" onclick="startTransfer(true)" disabled>↻ Retry lỗi</button>
+                    <div class="delay-box">
+                        <label for="tfDelay">Delay</label>
+                        <input type="number" id="tfDelay" value="300" min="0" step="100" title="ms giữa mỗi domain">
+                        <span>ms</span>
+                    </div>
+                </div>
+                <div class="progress" id="tfProgress">Sẵn sàng kiểm tra</div>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table>
+                        <thead><tr><th>Domain</th><th>Kết quả</th><th>Ngày đăng ký</th><th>Tuổi domain</th><th>Nhà đăng ký</th><th>Trạng thái Domain</th></tr></thead>
+                        <tbody id="tfBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= TAB: KIỂM TRA GIÁ (CHỈ DẪN LINK) ================= -->
+        <div class="tab-panel" id="tab-price">
+            <div class="note-box">
+                <span class="note-icon">⚠️</span>
+                <div>Nếu giá domain rẻ bất thường, vui lòng liên hệ IT mua domain để được hỗ trợ kiểm tra giá</div>
+            </div>
+            <div class="price-grid">
+                <div class="card price-card">
+                    <h3>🛒 Giá domain mua mới trên GoDaddy</h3>
+                    <p>Mở trang Bulk Domain Search của GoDaddy ở tab mới để kiểm tra giá mua mới.
+                       Đây chỉ là liên kết sang GoDaddy — việc kiểm tra giá thực hiện trên GoDaddy, không thực hiện trên website này.</p>
+                    <a class="link-btn" href="https://www.godaddy.com/en/domains/bulk-domain-search" target="_blank" rel="noopener noreferrer">↗ Mở GoDaddy Bulk Domain Search</a>
+                </div>
+                <div class="card price-card">
+                    <h3>⇄ Giá transfer về GoDaddy</h3>
+                    <p>Mở trang Domain Transfer của GoDaddy ở tab mới để kiểm tra giá transfer.
+                       Đây chỉ là liên kết sang GoDaddy — việc kiểm tra giá thực hiện trên GoDaddy, không thực hiện trên website này.</p>
+                    <a class="link-btn" href="https://www.godaddy.com/en/domains/domain-transfer" target="_blank" rel="noopener noreferrer">↗ Mở GoDaddy Domain Transfer</a>
+                </div>
+            </div>
+        </div>
+
+{% if is_admin %}
+        <!-- ================= TAB (ADMIN): ĐUÔI CẤM / CHO PHÉP ================= -->
+        <div class="tab-panel" id="tab-rules">
+            <div class="note-box">
+                <span class="note-icon">⚙</span>
+                <div>
+                    <strong>Chỉnh đuôi cấm / cho phép đặc biệt theo từng nhà cung cấp</strong> (mỗi dòng hoặc cách nhau bằng dấu cách/phẩy).<br>
+                    <code>.uk</code> = cả đuôi .uk và mọi .xx.uk (.co.uk, .org.uk…) · <code>.co.uk</code> = chỉ đúng đuôi đó · <code>*.uk</code> = chỉ các .xx.uk (không gồm .uk thuần).<br>
+                    Đuôi cụ thể hơn thắng đuôi chung; cùng mức thì "cho phép" thắng. Từ khóa theo dạng <code>.in:india</code> (đuôi .in mà tên domain chứa "india" thì cấm).
+                </div>
+            </div>
+            <div class="rules-edit-grid" id="rulesEditor"><div class="skipped">Đang tải…</div></div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): DOMAIN CẤM ================= -->
+        <div class="tab-panel" id="tab-blocks">
+            <div class="card">
+                <div class="section-title">Thêm domain vào danh sách cấm (ẩn)</div>
+                <p class="hint" style="margin-top:0">Các domain này sẽ bị tính là KHÔNG MUA ĐƯỢC tại những nhà cung cấp bạn chọn. Danh sách chỉ admin xem và chỉnh sửa; người dùng khác chỉ thấy kết quả bị cấm khi kiểm tra.</p>
+                <textarea id="blkInput" style="margin-top:12px" placeholder="Dán danh sách domain (mỗi dòng 1 domain, hoặc cách nhau bằng dấu cách / phẩy)&#10;example.com&#10;example.net"></textarea>
+                <div class="check-grid" id="blkRegs"></div>
+                <div class="action-bar">
+                    <button class="btn-primary" id="btnBlkAdd">+ Thêm vào danh sách cấm</button>
+                    <span class="msg" id="blkMsg"></span>
+                </div>
+            </div>
+            <div class="card">
+                <div class="form-row">
+                    <div class="form-group"><label for="blkSearch">Tìm domain trong danh sách</label>
+                        <input class="field field-mono" id="blkSearch" placeholder="vd: example" autocomplete="off"></div>
+                    <button class="btn-secondary" id="btnBlkReload">↻ Tải lại</button>
+                </div>
+                <div class="hint" id="blkCount"></div>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table class="tbl-sm">
+                        <thead><tr><th>Domain</th><th>Bị cấm tại</th><th>Thêm bởi</th><th>Thời gian</th><th></th></tr></thead>
+                        <tbody id="blkBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): TÀI KHOẢN ================= -->
+        <div class="tab-panel" id="tab-users">
+            <div class="note-box" id="pwWarn" style="display:none">
+                <span class="note-icon">⚠️</span>
+                <div>Tài khoản <b>admin</b> vẫn đang dùng mật khẩu mặc định. Hãy bấm "Sửa" ở dòng admin và đổi mật khẩu ngay.</div>
+            </div>
+            <div class="card">
+                <div class="section-title">Tạo tài khoản mới</div>
+                <div class="form-row" style="margin-top:12px">
+                    <div class="form-group"><label for="nuName">Tên đăng nhập</label>
+                        <input class="field" id="nuName" maxlength="32" autocomplete="off" placeholder="3–32 ký tự: chữ, số, _ . -"></div>
+                    <div class="form-group"><label for="nuPass">Mật khẩu</label>
+                        <div class="inline-row">
+                            <input class="field field-mono" id="nuPass" type="text" autocomplete="off" placeholder="Tối thiểu 6 ký tự">
+                            <button type="button" class="btn-secondary" id="btnNuRand" title="Tạo mật khẩu ngẫu nhiên 8 ký tự">🎲 Ngẫu nhiên</button>
+                        </div></div>
+                    <button class="btn-primary" id="btnCreateUser">+ Tạo tài khoản</button>
+                </div>
+                <div class="msg" id="nuMsg"></div>
+                <p class="hint">Mật khẩu được mã hóa khi lưu nên không xem lại được — hãy sao chép gửi cho người dùng trước khi rời trang. Quên mật khẩu thì dùng "Sửa" để đặt lại. Chỉ tài khoản tên <b>admin</b> mới có quyền quản trị.</p>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table class="tbl-sm">
+                        <thead><tr><th>Tên đăng nhập</th><th>Quyền</th><th>Tạo lúc</th><th>Cập nhật</th><th></th></tr></thead>
+                        <tbody id="userBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+{% endif %}
+
         <div class="footer">
             DEV by <span>Ares</span>
         </div>
@@ -1920,6 +2208,26 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+
+{% if is_admin %}
+    <!-- Edit user Modal -->
+    <div id="userModal" class="modal">
+        <div class="modal-content">
+            <span class="close-btn" id="userModalClose">&times;</span>
+            <h3>✎ Sửa tài khoản</h3>
+            <input type="hidden" id="euOld">
+            <div class="form-group"><label for="euName">Tên đăng nhập</label>
+                <input class="field" id="euName" maxlength="32" autocomplete="off"></div>
+            <div class="form-group" style="margin-top:14px"><label for="euPass">Mật khẩu mới (để trống = giữ nguyên)</label>
+                <div class="inline-row">
+                    <input class="field field-mono" id="euPass" type="text" autocomplete="off">
+                    <button type="button" class="btn-secondary" id="btnEuRand" title="Tạo mật khẩu ngẫu nhiên 8 ký tự">🎲</button>
+                </div></div>
+            <div class="msg err" id="euMsg"></div>
+            <button class="btn-primary" id="btnEuSave" style="margin-top:14px; width:100%; justify-content:center;">Lưu thay đổi</button>
+        </div>
+    </div>
+{% endif %}
     <script>
         const CSRF_TOKEN = "{{ csrf_token }}";
         const modal = document.getElementById("settingsModal");
@@ -2033,177 +2341,6 @@ HTML_TEMPLATE = """
 
         async function sleep(ms) {
             return new Promise(r => setTimeout(r, ms));
-        }
-
-
-        function switchFeature(name, button) {
-            document.querySelectorAll('.feature-tab').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.feature-panel').forEach(p => p.style.display = 'none');
-            document.querySelectorAll('.feature-tab').forEach(b => {
-                if (b.getAttribute('onclick') && b.getAttribute('onclick').includes("'" + name + "'")) b.classList.add('active');
-            });
-            const target = document.getElementById('feature-' + name);
-            if (target) target.style.display = 'block';
-            if (name === 'admin' && typeof loadAdminData === 'function') loadAdminData();
-        }
-
-        async function startTransferCheck() {
-            const raw = document.getElementById('transferList').value;
-            const reDomain = /(?:https?:\/\/)?(?:www\.)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)/i;
-            const domains = [...new Set(raw.split(/\r?\n/).map(x => {
-                const m = x.trim().toLowerCase().match(reDomain); return m ? m[1] : null;
-            }).filter(Boolean))];
-            if (!domains.length) { alert('Vui lòng nhập ít nhất 1 domain hợp lệ!'); return; }
-
-            const body = document.getElementById('transferBody');
-            body.innerHTML = '';
-            const progress = document.getElementById('transferProgress');
-            for (let i = 0; i < domains.length; i++) {
-                const domain = domains[i];
-                progress.innerHTML = `<span class="progress-dot"></span> Đang kiểm tra ${i+1}/${domains.length} — <b style="color:#93c5fd">${domain}</b>`;
-                const row = document.createElement('tr');
-                row.innerHTML = `<td class="domain-cell">${domain}</td><td colspan="4" class="skipped">Đang kiểm tra…</td>`;
-                body.appendChild(row);
-                try {
-                    const response = await fetch('/api/transfer-check', {
-                        method:'POST',
-                        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN},
-                        body:JSON.stringify({domain})
-                    });
-                    if (response.status === 401 || response.status === 403) { location.href='/login'; return; }
-                    const d = await response.json();
-                    const result = d.eligible
-                        ? '<span class="badge badge-success">ĐỦ ĐIỀU KIỆN</span>'
-                        : '<span class="badge badge-danger">CHƯA ĐỦ</span>';
-                    const lock = d.transfer_locked
-                        ? '<span class="badge badge-warning">ĐANG KHÓA</span>'
-                        : '<span class="badge badge-success">Không khóa</span>';
-                    row.innerHTML = `<td class="domain-cell">${domain}</td>
-                        <td>${d.created || 'Không xác định'}</td>
-                        <td>${d.age_days == null ? '—' : d.age_days}</td>
-                        <td>${lock}</td>
-                        <td>${result}<div class="buy-reason">${d.reason || ''}</div></td>`;
-                } catch (e) {
-                    row.innerHTML = `<td class="domain-cell">${domain}</td><td colspan="4" class="error-cell">Lỗi network / backend</td>`;
-                }
-            }
-            progress.innerHTML = `✓ Hoàn thành ${domains.length}/${domains.length} domain`;
-        }
-
-        async function adminFetch(url, options={}) {
-            options.headers = Object.assign({'Content-Type':'application/json','X-CSRF-Token':CSRF_TOKEN}, options.headers || {});
-            const r = await fetch(url, options);
-            if (r.status === 401) { location.href='/login'; return null; }
-            if (r.status === 403) { alert('Bạn không có quyền admin.'); return null; }
-            const d = await r.json().catch(() => ({}));
-            if (!r.ok) throw new Error(d.error || 'Request failed');
-            return d;
-        }
-
-        let adminRules = {};
-        async function loadAdminData() {
-            try {
-                const d = await adminFetch('/api/admin/rules');
-                if (!d) return;
-                adminRules = d.rules || {};
-                loadProviderRule();
-                renderHiddenDomains(d.hidden_domains || []);
-                const u = await adminFetch('/api/admin/users');
-                if (u) renderUsers(u.users || []);
-            } catch(e) { alert(e.message); }
-        }
-
-        function loadProviderRule() {
-            const p = document.getElementById('ruleProvider');
-            if (!p) return;
-            const rule = adminRules[p.value] || {banned_tlds:[], allowed_tlds:[], banned_domain_patterns:[]};
-            document.getElementById('bannedTlds').value = (rule.banned_tlds || []).join('\\n');
-            document.getElementById('allowedTlds').value = (rule.allowed_tlds || []).join('\\n');
-            document.getElementById('bannedPatterns').value = (rule.banned_domain_patterns || []).join('\\n');
-        }
-
-        async function saveProviderRule() {
-            try {
-                const provider = document.getElementById('ruleProvider').value;
-                const d = await adminFetch('/api/admin/rules/provider', {
-                    method:'POST',
-                    body:JSON.stringify({
-                        provider,
-                        banned_tlds:document.getElementById('bannedTlds').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),
-                        allowed_tlds:document.getElementById('allowedTlds').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean),
-                        banned_domain_patterns:document.getElementById('bannedPatterns').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)
-                    })
-                });
-                if (d) { adminRules[provider] = d.rules; alert('Đã lưu luật ' + provider); }
-            } catch(e) { alert(e.message); }
-        }
-
-        async function addHiddenDomains() {
-            try {
-                const providers = [...document.querySelectorAll('.hidden-provider:checked')].map(x=>x.value);
-                if (document.getElementById('hiddenAllProviders').checked) providers.push('*');
-                const domains = document.getElementById('hiddenDomainsInput').value.split(/\r?\n/).map(x=>x.trim().toLowerCase()).filter(Boolean);
-                if (!providers.length) { alert('Vui lòng chọn nhà cung cấp.'); return; }
-                if (!domains.length) { alert('Vui lòng nhập domain.'); return; }
-                const d = await adminFetch('/api/admin/hidden-domains', {method:'POST',body:JSON.stringify({domains,providers})});
-                if (d) { renderHiddenDomains(d.hidden_domains || []); document.getElementById('hiddenDomainsInput').value=''; }
-            } catch(e) { alert(e.message); }
-        }
-
-        function renderHiddenDomains(items) {
-            const box = document.getElementById('hiddenDomainList');
-            if (!box) return;
-            box.innerHTML = items.map(x => `<div class="admin-row"><span><code>${escapeHtml(x.domain)}</code> — ${(x.providers||[]).join(', ')}</span><button class="btn-secondary" onclick="deleteHiddenDomain('${encodeURIComponent(x.domain)}')">Xóa</button></div>`).join('') || '<div class="skipped">Chưa có domain ẩn.</div>';
-        }
-
-        async function deleteHiddenDomain(encoded) {
-            if (!confirm('Xóa domain ẩn này?')) return;
-            try {
-                const d = await adminFetch('/api/admin/hidden-domains/' + encoded, {method:'DELETE'});
-                if (d) renderHiddenDomains(d.hidden_domains || []);
-            } catch(e) { alert(e.message); }
-        }
-
-        async function generateAdminPassword() {
-            try {
-                const d = await adminFetch('/api/admin/random-password');
-                if (d) document.getElementById('userPassword').value = d.password;
-            } catch(e) { alert(e.message); }
-        }
-
-        async function saveAdminUser() {
-            try {
-                const username = document.getElementById('userName').value.trim();
-                const password = document.getElementById('userPassword').value;
-                const role = document.getElementById('userRole').value;
-                const d = await adminFetch('/api/admin/users', {method:'POST',body:JSON.stringify({username,password,role})});
-                if (d) {
-                    alert('Đã lưu user.');
-                    document.getElementById('userPassword').value='';
-                    const u = await adminFetch('/api/admin/users'); if (u) renderUsers(u.users || []);
-                }
-            } catch(e) { alert(e.message); }
-        }
-
-        function renderUsers(items) {
-            const box = document.getElementById('userList');
-            if (!box) return;
-            box.innerHTML = items.map(x => `<div class="admin-row">
-                <span>👤 <b>${escapeHtml(x.username)}</b> — <span class="badge ${x.role==='admin'?'badge-info':'badge-muted'}">${escapeHtml(x.role)}</span></span>
-                ${x.username==='admin' ? '' : `<button class="btn-secondary" onclick="deleteAdminUser('${encodeURIComponent(x.username)}')">Xóa</button>`}
-            </div>`).join('');
-        }
-
-        async function deleteAdminUser(encoded) {
-            if (!confirm('Xóa tài khoản này?')) return;
-            try {
-                const d = await adminFetch('/api/admin/users/' + encoded, {method:'DELETE'});
-                if (d) { const u = await adminFetch('/api/admin/users'); if (u) renderUsers(u.users || []); }
-            } catch(e) { alert(e.message); }
-        }
-
-        function escapeHtml(s) {
-            return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
         }
 
         async function startCheck(isRetry = false) {
@@ -2323,6 +2460,315 @@ HTML_TEMPLATE = """
             btnRetry.disabled = failedDomains.length === 0;
             updateLegendVisibility();
         }
+
+        // ================= TÍNH NĂNG MỚI: TABS / TRANSFER / ADMIN =================
+        const IS_ADMIN = {{ 'true' if is_admin else 'false' }};
+        const REGISTRARS = {{ registrars|tojson }};
+        let RULES_SUMMARY = {{ rules_summary|tojson }};
+        const NL = String.fromCharCode(10);
+        const el = id => document.getElementById(id);
+
+        function esc(s) {
+            return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+        function fmtTime(iso) {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            return isNaN(d) ? '—' : d.toLocaleString('vi-VN');
+        }
+        function setMsg(id, text, ok) {
+            const m = el(id);
+            if (!m) return;
+            m.textContent = text || '';
+            m.className = 'msg ' + (text ? (ok ? 'ok' : 'err') : '');
+        }
+
+        // ---- tóm tắt tiêu chí cấm (động theo cấu hình admin) ----
+        function renderRulesSummary() {
+            el('rulesGrid').innerHTML = RULES_SUMMARY.map(r =>
+                '<div class="rule-item"><strong>' + esc(r.name) + '</strong><span>' +
+                r.lines.map(l => esc(l)).join('<br>') + '</span></div>').join('');
+        }
+
+        // ---- tabs ----
+        const loaded = {};
+        function showTab(name) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('show', p.id === 'tab-' + name));
+            if (!IS_ADMIN) return;
+            if (name === 'rules' && !loaded.rules) loadRules();
+            if (name === 'blocks' && !loaded.blocks) loadBlocks();
+            if (name === 'users' && !loaded.users) loadUsers();
+        }
+
+        // ---- parse danh sách domain (giống logic nhập ở tab Kiểm tra mua) ----
+        function parseDomains(text) {
+            const re = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
+            const splitter = new RegExp('[^a-z0-9.:/-]+');
+            const out = [], seen = new Set();
+            text.split(NL).forEach(line => {
+                const tok = line.trim().toLowerCase().split(splitter)[0] || '';
+                let d = tok.replace(new RegExp('^[a-z]+://'), '').split('/')[0].split(':')[0];
+                if (d.indexOf('www.') === 0) d = d.slice(4);
+                d = d.replace(new RegExp('[.]+$'), '');
+                if (d.length > 3 && re.test(d) && !seen.has(d)) { seen.add(d); out.push(d); }
+            });
+            return out;
+        }
+
+        // ---- TAB KIỂM TRA TRANSFER ----
+        let tfFailed = [];
+        async function startTransfer(isRetry) {
+            const btn = el('btnTf'), btnRetry = el('btnTfRetry'), tbody = el('tfBody');
+            let domains;
+            if (isRetry) {
+                domains = tfFailed.slice();
+                if (!domains.length) { alert('Không có domain lỗi để retry!'); return; }
+            } else {
+                domains = parseDomains(el('tfList').value);
+                if (!domains.length) { alert('Vui lòng nhập ít nhất 1 domain hợp lệ!'); return; }
+                tfFailed = [];
+                tbody.innerHTML = '';
+            }
+            const delay = Math.max(0, parseInt(el('tfDelay').value) || 0);
+            btn.disabled = true; btnRetry.disabled = true;
+            let completed = 0;
+            const total = domains.length;
+            for (const domain of domains) {
+                el('tfProgress').innerHTML = '<span class="progress-dot"></span> Đang xử lý ' + (completed + 1) + '/' + total +
+                    ' — <b style="color:#93c5fd">' + esc(domain) + '</b>';
+                let row = el('tf-' + domain);
+                if (!row) { row = document.createElement('tr'); row.id = 'tf-' + domain; tbody.appendChild(row); }
+                row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td><td colspan="5" class="skipped">Đang quét dữ liệu…</td>';
+                try {
+                    const r = await fetch('/api/transfer-check', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+                        body: JSON.stringify({ domain })
+                    });
+                    if (r.status === 401 || r.status === 403) { window.location.href = '/login'; return; }
+                    if (r.status === 429) { await sleep(5000); throw new Error('rate limited'); }
+                    if (!r.ok) throw new Error('Server error');
+                    const d = await r.json();
+                    const dates = d.created
+                        ? '<span class="date-cell">' + esc(d.created) + '</span>' + (d.expires ? '<div class="skipped">hết hạn ' + esc(d.expires) + '</div>' : '')
+                        : '—';
+                    const age = d.age_days != null ? '<span class="date-cell">' + d.age_days + ' ngày</span>' : '—';
+                    row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td>' +
+                        '<td class="buy-cell">' + (d.result_html || '') + '</td>' +
+                        '<td>' + dates + '</td><td>' + age + '</td>' +
+                        '<td>' + (d.registrar || '') + '</td>' +
+                        '<td class="status-cell">' + (d.status || '') + '</td>';
+                    if (d.failed) { if (!tfFailed.includes(domain)) tfFailed.push(domain); }
+                    else tfFailed = tfFailed.filter(x => x !== domain);
+                } catch (e) {
+                    row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td><td colspan="5" class="error-cell">Lỗi network / quá tải — thử lại sau</td>';
+                    if (!tfFailed.includes(domain)) tfFailed.push(domain);
+                }
+                completed++;
+                if (completed < total && delay > 0) await sleep(delay);
+            }
+            el('tfProgress').innerHTML = '✓ Hoàn thành ' + completed + '/' + total + ' domain' +
+                (tfFailed.length ? ' · <span style="color:#f87171">' + tfFailed.length + ' lỗi</span>' : '');
+            btn.disabled = false;
+            btnRetry.disabled = tfFailed.length === 0;
+        }
+
+        // ---- ADMIN: helper gọi API ----
+        async function adminApi(url, body) {
+            const opt = { method: body === undefined ? 'GET' : 'POST', headers: { 'X-CSRF-Token': CSRF_TOKEN } };
+            if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+            const r = await fetch(url, opt);
+            if (r.status === 401) { window.location.href = '/login'; throw new Error('Phiên đã hết hạn'); }
+            let data = {};
+            try { data = await r.json(); } catch (e) { /* ignore */ }
+            if (!r.ok) throw new Error(data.error || ('Lỗi ' + r.status));
+            return data;
+        }
+
+        // ---- ADMIN: mật khẩu ngẫu nhiên 8 ký tự ----
+        function randInt(n) {
+            const a = new Uint32Array(1);
+            const lim = Math.floor(4294967296 / n) * n;
+            do { crypto.getRandomValues(a); } while (a[0] >= lim);
+            return a[0] % n;
+        }
+        function randomPassword() {
+            const U = 'ABCDEFGHJKLMNPQRSTUVWXYZ', L = 'abcdefghijkmnpqrstuvwxyz', D = '23456789';
+            const all = U + L + D;
+            const pick = s => s[randInt(s.length)];
+            const c = [pick(U), pick(L), pick(D)];
+            while (c.length < 8) c.push(pick(all));
+            for (let i = c.length - 1; i > 0; i--) { const j = randInt(i + 1); const t = c[i]; c[i] = c[j]; c[j] = t; }
+            return c.join('');
+        }
+
+        // ---- ADMIN: đuôi cấm / cho phép ----
+        let RULES_DATA = null;
+        async function loadRules() {
+            try {
+                const data = await adminApi('/api/admin/rules');
+                RULES_DATA = data.rules;
+                loaded.rules = true;
+                renderRulesEditor();
+            } catch (e) {
+                el('rulesEditor').innerHTML = '<div class="error-cell">' + esc(e.message) + '</div>';
+            }
+        }
+        function renderRulesEditor() {
+            el('rulesEditor').innerHTML = REGISTRARS.map(reg => {
+                const r = RULES_DATA[reg] || { banned: [], allowed: [], keywords: [] };
+                return '<div class="reg-card" data-reg="' + esc(reg) + '"><h4>' + esc(reg) + '</h4>' +
+                    '<div class="form-group"><label>⛔ Đuôi bị cấm</label><textarea class="field field-mono" data-f="banned" placeholder=".ch .li .cn">' + esc(r.banned.join(NL)) + '</textarea></div>' +
+                    '<div class="form-group"><label>✅ Đuôi cho phép đặc biệt</label><textarea class="field field-mono" data-f="allowed" placeholder="*.uk">' + esc(r.allowed.join(NL)) + '</textarea></div>' +
+                    '<div class="form-group"><label>🔎 Cấm theo từ khóa (đuôi:từ khóa)</label><textarea class="field field-mono" data-f="keywords" placeholder=".in:india">' + esc(r.keywords.join(NL)) + '</textarea></div>' +
+                    '<div class="action-bar" style="margin-top:6px">' +
+                    '<button class="btn-primary btn-sm" data-act="save">Lưu</button>' +
+                    '<button class="btn-secondary btn-sm" data-act="reset">Khôi phục mặc định</button></div>' +
+                    '<div class="msg" data-msg></div></div>';
+            }).join('');
+        }
+        async function ruleAction(card, act) {
+            const reg = card.dataset.reg, msg = card.querySelector('[data-msg]');
+            const setM = (t, ok) => { msg.textContent = t; msg.className = 'msg ' + (ok ? 'ok' : 'err'); };
+            try {
+                let data;
+                if (act === 'reset') {
+                    if (!confirm('Khôi phục quy tắc mặc định cho ' + reg + '?')) return;
+                    data = await adminApi('/api/admin/rules/reset', { registrar: reg });
+                } else {
+                    const body = { registrar: reg };
+                    card.querySelectorAll('textarea[data-f]').forEach(t => { body[t.dataset.f] = t.value; });
+                    data = await adminApi('/api/admin/rules/save', body);
+                }
+                RULES_DATA[reg] = data.rule;
+                RULES_SUMMARY = data.summary;
+                renderRulesSummary();
+                card.querySelectorAll('textarea[data-f]').forEach(t => { t.value = (data.rule[t.dataset.f] || []).join(NL); });
+                setM(act === 'reset' ? 'Đã khôi phục mặc định' : 'Đã lưu', true);
+            } catch (e) { setM(e.message, false); }
+        }
+
+        // ---- ADMIN: domain cấm ----
+        function initBlockChips() {
+            el('blkRegs').innerHTML = REGISTRARS.map(r =>
+                '<label class="check-chip"><input type="checkbox" class="blk-reg" value="' + esc(r) + '"> ' + esc(r) + '</label>').join('') +
+                '<label class="check-chip"><input type="checkbox" id="blkAll"> <b>Chọn tất cả</b></label>';
+            el('blkAll').addEventListener('change', e => {
+                document.querySelectorAll('.blk-reg').forEach(c => { c.checked = e.target.checked; });
+            });
+        }
+        async function loadBlocks() {
+            try {
+                const q = el('blkSearch').value.trim();
+                const data = await adminApi('/api/admin/blocks?q=' + encodeURIComponent(q));
+                loaded.blocks = true;
+                el('blkCount').textContent = data.total + ' domain trong danh sách' + (data.total > data.items.length ? ' (hiển thị ' + data.items.length + ' mới nhất — dùng ô tìm kiếm để lọc)' : '');
+                el('blkBody').innerHTML = data.items.length ? data.items.map(it =>
+                    '<tr><td class="domain-cell">' + esc(it.domain) + '</td><td>' +
+                    it.registrars.map(r => '<span class="tag-x">' + esc(r) + '<button title="Bỏ cấm tại ' + esc(r) + '" data-d="' + esc(it.domain) + '" data-r="' + esc(r) + '">×</button></span>').join('') +
+                    '</td><td>' + esc(it.added_by || '—') + '</td><td class="date-cell">' + esc(fmtTime(it.created_at)) + '</td>' +
+                    '<td><button class="btn-danger btn-sm" data-d="' + esc(it.domain) + '">Xóa</button></td></tr>').join('')
+                    : '<tr><td colspan="5" class="skipped">Danh sách trống</td></tr>';
+            } catch (e) {
+                el('blkBody').innerHTML = '<tr><td colspan="5" class="error-cell">' + esc(e.message) + '</td></tr>';
+            }
+        }
+        async function addBlocks() {
+            const regs = Array.from(document.querySelectorAll('.blk-reg')).filter(c => c.checked).map(c => c.value);
+            if (!regs.length) { setMsg('blkMsg', 'Hãy chọn ít nhất 1 nhà cung cấp', false); return; }
+            try {
+                const data = await adminApi('/api/admin/blocks/add', { domains: el('blkInput').value, registrars: regs });
+                setMsg('blkMsg', 'Đã thêm / cập nhật ' + data.count + ' domain', true);
+                el('blkInput').value = '';
+                loadBlocks();
+            } catch (e) { setMsg('blkMsg', e.message, false); }
+        }
+
+        // ---- ADMIN: tài khoản ----
+        async function loadUsers() {
+            try {
+                const data = await adminApi('/api/admin/users');
+                loaded.users = true;
+                el('pwWarn').style.display = data.users.some(u => u.username === 'admin' && u.default_pw) ? 'flex' : 'none';
+                el('userBody').innerHTML = data.users.map(u => {
+                    const role = u.role === 'admin' ? '<span class="badge badge-info">ADMIN</span>' : '<span class="badge badge-muted">USER</span>';
+                    const actions = u.source === 'env'
+                        ? '<span class="skipped">cấu hình APP_USERS (chỉ đọc)</span>'
+                        : '<button class="btn-secondary btn-sm" data-edit="' + esc(u.username) + '">✎ Sửa</button> ' +
+                          (u.role === 'admin' ? '' : '<button class="btn-danger btn-sm" data-del="' + esc(u.username) + '">Xóa</button>');
+                    return '<tr><td class="domain-cell">' + esc(u.username) + '</td><td>' + role + '</td><td class="date-cell">' +
+                        esc(fmtTime(u.created_at)) + '</td><td class="date-cell">' + esc(fmtTime(u.updated_at)) + '</td><td>' + actions + '</td></tr>';
+                }).join('');
+            } catch (e) {
+                el('userBody').innerHTML = '<tr><td colspan="5" class="error-cell">' + esc(e.message) + '</td></tr>';
+            }
+        }
+        async function createUser() {
+            try {
+                await adminApi('/api/admin/users/create', { username: el('nuName').value, password: el('nuPass').value });
+                setMsg('nuMsg', 'Đã tạo tài khoản "' + el('nuName').value.trim() + '" — mật khẩu: ' + el('nuPass').value + ' (hãy sao chép ngay)', true);
+                el('nuName').value = ''; el('nuPass').value = '';
+                loadUsers();
+            } catch (e) { setMsg('nuMsg', e.message, false); }
+        }
+        const userModal = IS_ADMIN ? el('userModal') : null;
+        function openUserModal(name) {
+            el('euOld').value = name; el('euName').value = name; el('euPass').value = ''; setMsg('euMsg', '');
+            el('euName').disabled = (name === 'admin');
+            userModal.classList.add('show');
+        }
+        function closeUserModal() { userModal.classList.remove('show'); }
+        async function saveUser() {
+            try {
+                await adminApi('/api/admin/users/update', {
+                    username: el('euOld').value, new_username: el('euName').value, password: el('euPass').value
+                });
+                closeUserModal();
+                loadUsers();
+            } catch (e) { setMsg('euMsg', e.message, false); }
+        }
+        async function deleteUser(name) {
+            if (!confirm('Xóa tài khoản "' + name + '"? Người dùng sẽ bị đăng xuất.')) return;
+            try { await adminApi('/api/admin/users/delete', { username: name }); loadUsers(); }
+            catch (e) { alert(e.message); }
+        }
+
+        // ---- khởi tạo ----
+        document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
+        renderRulesSummary();
+        if (IS_ADMIN) {
+            initBlockChips();
+            el('rulesEditor').addEventListener('click', e => {
+                const b = e.target.closest('button[data-act]');
+                if (b) ruleAction(b.closest('.reg-card'), b.dataset.act);
+            });
+            el('btnBlkAdd').addEventListener('click', addBlocks);
+            el('btnBlkReload').addEventListener('click', loadBlocks);
+            let blkTimer = null;
+            el('blkSearch').addEventListener('input', () => { clearTimeout(blkTimer); blkTimer = setTimeout(loadBlocks, 300); });
+            el('blkBody').addEventListener('click', async e => {
+                const b = e.target.closest('button[data-d]');
+                if (!b) return;
+                const d = b.dataset.d, r = b.dataset.r;
+                if (!r && !confirm('Xóa "' + d + '" khỏi danh sách cấm?')) return;
+                try { await adminApi('/api/admin/blocks/remove', r ? { domain: d, registrar: r } : { domain: d }); loadBlocks(); }
+                catch (err) { alert(err.message); }
+            });
+            el('btnNuRand').addEventListener('click', () => { el('nuPass').value = randomPassword(); });
+            el('btnEuRand').addEventListener('click', () => { el('euPass').value = randomPassword(); });
+            el('btnCreateUser').addEventListener('click', createUser);
+            el('btnEuSave').addEventListener('click', saveUser);
+            el('userModalClose').addEventListener('click', closeUserModal);
+            userModal.addEventListener('click', e => { if (e.target === userModal) closeUserModal(); });
+            el('userBody').addEventListener('click', e => {
+                const ed = e.target.closest('button[data-edit]');
+                if (ed) openUserModal(ed.dataset.edit);
+                const dl = e.target.closest('button[data-del]');
+                if (dl) deleteUser(dl.dataset.del);
+            });
+        }
     </script>
 </body>
 </html>
@@ -2407,8 +2853,8 @@ def healthz():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if not USERS and MONGO_USERS is None:
-        return "Chưa cấu hình user. Hãy cấu hình MONGODB_URI hoặc APP_USERS.", 503
+    if not auth_ready():
+        return "Chưa kết nối được MongoDB và chưa cấu hình APP_USERS trên server.", 503
     if session.get("user"):
         return redirect(url_for("index"))
 
@@ -2423,10 +2869,12 @@ def login():
         else:
             username = request.form.get("username", "").strip()
             password = request.form.get("password", "")
-            if verify_password(username, password):
+            rec = authenticate(username, password)
+            if rec:
                 login_limiter.clear(ip)
                 session.clear()                                   # chống session fixation
-                session["user"] = username
+                session["user"] = rec["username"]
+                session["pv"] = rec["pv"]
                 session["csrf"] = secrets.token_urlsafe(32)
                 session.permanent = True
                 log.info("Đăng nhập thành công: %s (%s)", username, ip)
@@ -2454,210 +2902,10 @@ def index():
     if not session.get("csrf"):
         session["csrf"] = secrets.token_urlsafe(32)
     return render_template_string(
-        HTML_TEMPLATE,
-        username=session["user"],
-        csrf_token=session["csrf"],
-        is_admin=is_admin(),
-        providers=list(PROVIDERS),
+        HTML_TEMPLATE, username=session["user"], csrf_token=session["csrf"],
+        is_admin=is_admin(), registrars=REGISTRARS, rules_summary=rules_summary(),
     )
 
-
-
-@app.route("/api/admin/rules", methods=["GET"])
-@login_required
-def admin_rules_get():
-    if not is_admin():
-        return jsonify(error="forbidden"), 403
-    return jsonify(providers=list(PROVIDERS), rules=get_provider_rules(),
-                   hidden_domains=get_hidden_domains())
-
-@app.route("/api/admin/rules/provider", methods=["POST"])
-@admin_required
-def admin_rules_provider():
-    try:
-        data = request.get_json(silent=True) or {}
-        provider = str(data.get("provider", "")).strip()
-        update_provider_rule(
-            provider,
-            data.get("banned_tlds") or [],
-            data.get("allowed_tlds") or [],
-            data.get("banned_domain_patterns") or [],
-        )
-        return jsonify(ok=True, rules=get_provider_rules()[provider])
-    except Exception as e:
-        log.exception("Cập nhật provider rule lỗi")
-        return jsonify(error=str(e)), 400
-
-@app.route("/api/admin/hidden-domains", methods=["POST"])
-@admin_required
-def admin_hidden_domains_add():
-    try:
-        if MONGO_HIDDEN is None:
-            return jsonify(error="MongoDB chưa kết nối"), 503
-        data = request.get_json(silent=True) or {}
-        domains = data.get("domains") or []
-        providers = [p for p in (data.get("providers") or []) if p in PROVIDERS]
-        if "*" in (data.get("providers") or []):
-            providers = ["*"]
-        if not providers:
-            return jsonify(error="Chọn ít nhất một nhà cung cấp"), 400
-
-        added = 0
-        for raw in domains:
-            d = str(raw).strip().lower().rstrip(".")
-            if not DOMAIN_RE.match(d):
-                continue
-            MONGO_HIDDEN.update_one(
-                {"domain": d},
-                {"$set": {"domain": d, "providers": providers, "updated_at": _mongo_now(),
-                          "updated_by": session["user"]}},
-                upsert=True,
-            )
-            added += 1
-        return jsonify(ok=True, added=added, hidden_domains=get_hidden_domains())
-    except Exception as e:
-        log.exception("Thêm hidden domain lỗi")
-        return jsonify(error=str(e)), 400
-
-@app.route("/api/admin/hidden-domains/<path:domain>", methods=["DELETE"])
-@admin_required
-def admin_hidden_domains_delete(domain):
-    if MONGO_HIDDEN is None:
-        return jsonify(error="MongoDB chưa kết nối"), 503
-    d = str(domain).strip().lower().rstrip(".")
-    MONGO_HIDDEN.delete_one({"domain": d})
-    return jsonify(ok=True, hidden_domains=get_hidden_domains())
-
-@app.route("/api/admin/users", methods=["GET"])
-@admin_required
-def admin_users_get():
-    if MONGO_USERS is None:
-        return jsonify(error="MongoDB chưa kết nối"), 503
-    users = []
-    for d in MONGO_USERS.find({}, {"_id": 0, "username": 1, "role": 1, "created_at": 1, "updated_at": 1}).sort("username", 1):
-        for k in ("created_at", "updated_at"):
-            if isinstance(d.get(k), datetime):
-                d[k] = d[k].isoformat()
-        users.append(d)
-    return jsonify(users=users)
-
-@app.route("/api/admin/users", methods=["POST"])
-@admin_required
-def admin_users_save():
-    try:
-        if MONGO_USERS is None:
-            return jsonify(error="MongoDB chưa kết nối"), 503
-        data = request.get_json(silent=True) or {}
-        username = re.sub(r"[^A-Za-z0-9_.-]", "", str(data.get("username", "")).strip())
-        password = str(data.get("password", ""))
-        role = "admin" if str(data.get("role", "user")).lower() == "admin" else "user"
-        if not username:
-            return jsonify(error="Tên user không hợp lệ"), 400
-        if username == "admin":
-            role = "admin"
-        if len(username) > 64:
-            return jsonify(error="Tên user quá dài"), 400
-        if password and len(password) < 8:
-            return jsonify(error="Mật khẩu tối thiểu 8 ký tự"), 400
-
-        old = MONGO_USERS.find_one({"username": username})
-        now = _mongo_now()
-        update = {"role": role, "updated_at": now}
-        if password:
-            update["password_hash"] = generate_password_hash(password)
-        elif not old:
-            return jsonify(error="User mới bắt buộc phải có mật khẩu"), 400
-
-        MONGO_USERS.update_one(
-            {"username": username},
-            {"$set": update, "$setOnInsert": {"created_at": now}},
-            upsert=True,
-        )
-        return jsonify(ok=True)
-    except Exception as e:
-        log.exception("Lưu user lỗi")
-        return jsonify(error=str(e)), 400
-
-@app.route("/api/admin/users/<username>", methods=["DELETE"])
-@admin_required
-def admin_users_delete(username):
-    if MONGO_USERS is None:
-        return jsonify(error="MongoDB chưa kết nối"), 503
-    username = str(username).strip()
-    if username == "admin":
-        return jsonify(error="Không được xóa tài khoản admin"), 400
-    MONGO_USERS.delete_one({"username": username})
-    return jsonify(ok=True)
-
-@app.route("/api/admin/random-password", methods=["GET"])
-@admin_required
-def admin_random_password():
-    return jsonify(password=generate_random_password(8))
-
-@app.route("/api/transfer-check", methods=["POST"])
-@api_guard
-def api_transfer_check():
-    domain = ""
-    try:
-        data = request.get_json(silent=True) or {}
-        domain = str(data.get("domain", "")).strip().lower().rstrip(".")
-        if not DOMAIN_RE.match(domain):
-            return jsonify(error="Domain không hợp lệ", failed=True), 400
-
-        info = get_domain_info(domain)
-        created_text = info.get("created")
-        created_dt = None
-        if created_text:
-            try:
-                created_dt = datetime.strptime(created_text, "%d/%m/%y")
-            except ValueError:
-                created_dt = None
-
-        age_days = (datetime.utcnow() - created_dt).days if created_dt else None
-        statuses = set()
-        # Reconstruct key statuses from HTML-independent RDAP/WHOIS is not retained,
-        # so run a focused domain lookup and infer lock from the returned status HTML.
-        status_html = info.get("status_html", "")
-        transfer_locked = (
-            "clientTransferProhibited" in status_html
-            or "serverTransferProhibited" in status_html
-            or "Khóa Transfer" in status_html
-        )
-        pending_transfer = "Đang chuyển Registrar" in status_html
-        eligible = (
-            info.get("state") == "registered"
-            and age_days is not None
-            and age_days > 60
-            and not transfer_locked
-            and not pending_transfer
-        )
-        if info.get("state") != "registered":
-            reason = "Không xác định domain đã đăng ký" if info.get("state") == "unknown" else "Domain chưa đăng ký"
-        elif age_days is None:
-            reason = "Không lấy được ngày đăng ký"
-        elif age_days <= 60:
-            reason = f"Mới {age_days} ngày, chưa đủ hơn 60 ngày"
-        elif transfer_locked:
-            reason = "Đang bị khóa transfer"
-        elif pending_transfer:
-            reason = "Đang có transfer"
-        else:
-            reason = "Đủ điều kiện transfer theo các tiêu chí đang kiểm tra"
-
-        return jsonify({
-            "domain": domain,
-            "state": info.get("state"),
-            "created": created_text,
-            "age_days": age_days,
-            "transfer_locked": transfer_locked,
-            "pending_transfer": pending_transfer,
-            "eligible": eligible,
-            "reason": reason,
-            "failed": info.get("state") == "unknown",
-        })
-    except Exception:
-        log.exception("Transfer check lỗi %r", domain)
-        return jsonify(domain=domain, eligible=False, reason="Lỗi Backend", failed=True), 500
 
 @app.route("/api/check", methods=["POST"])
 @api_guard
@@ -2692,13 +2940,6 @@ def api_check():
         can_buy, buy_html = False, "Bỏ qua"
         if check_buy:
             results, tld_ok = check_buyability(domain)
-            hidden_providers = [
-                p for p in PROVIDERS if hidden_domain_provider_blocked(domain, p)
-            ]
-            if hidden_providers:
-                for p in hidden_providers:
-                    results[p] = {"ok": False, "reason": "Domain nằm trong danh sách cấm riêng"}
-                tld_ok = any(r["ok"] for r in results.values())
             state = info["state"] if info else "unknown"
             cf_ok = bool(cf) and not cf["failed"]
             can_buy = state == "unregistered" and tld_ok and cf_ok and not cf["blocked"]
@@ -2735,6 +2976,266 @@ def api_check():
             "expires": None,
             "failed": True,
         }), 500
+
+
+@app.route("/api/transfer-check", methods=["POST"])
+@api_guard
+def api_transfer_check():
+    domain = ""
+    try:
+        data = request.get_json(silent=True) or {}
+        domain = str(data.get("domain", "")).strip().lower().rstrip(".")
+        if not DOMAIN_RE.match(domain):
+            return jsonify(error="Domain không hợp lệ", failed=True), 400
+        return jsonify(check_transfer_eligibility(domain))
+    except Exception:  # noqa: BLE001
+        log.exception("Lỗi kiểm tra transfer %r", domain)
+        return jsonify({
+            "domain": domain or "Unknown", "eligible": False, "failed": True, "age_days": None,
+            "reasons": [], "registrar": "Lỗi", "status": "Lỗi", "created": None, "expires": None,
+            "result_html": _badge("badge-danger", "Lỗi"),
+        }), 500
+
+
+# ---------------- ADMIN: tài khoản ----------------
+def _no_db():
+    return jsonify(error="Chưa kết nối được MongoDB — kiểm tra MONGODB_URI / Network Access trên Atlas"), 503
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@admin_guard
+def api_admin_users():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    items, names = [], set()
+    for doc in db.users.find({}).sort("created_at", 1):
+        names.add(doc["username"].lower())
+        items.append({
+            "username": doc["username"],
+            "role": "admin" if doc["username"] == ADMIN_USERNAME else "user",
+            "created_at": _iso(doc.get("created_at")), "updated_at": _iso(doc.get("updated_at")),
+            "default_pw": bool(doc.get("default_pw")), "source": "db",
+        })
+    for name in USERS:                      # tài khoản cũ từ APP_USERS (chỉ đọc)
+        if name.lower() not in names:
+            items.append({"username": name, "role": "admin" if name == ADMIN_USERNAME else "user",
+                          "created_at": None, "updated_at": None, "default_pw": False, "source": "env"})
+    return jsonify(users=items)
+
+
+@app.route("/api/admin/users/create", methods=["POST"])
+@admin_guard
+def api_admin_user_create():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    err = _validate_username(username) or _validate_password(password)
+    if err:
+        return jsonify(error=err), 400
+    now = _now()
+    try:
+        db.users.insert_one({
+            "username": username, "username_lower": username.lower(),
+            "password_hash": generate_password_hash(password), "pv": secrets.token_hex(4),
+            "default_pw": False, "created_at": now, "updated_at": now, "created_by": session["user"],
+        })
+    except DuplicateKeyError:
+        return jsonify(error="Tên đăng nhập đã tồn tại"), 409
+    log.info("Admin %s tạo tài khoản %s", session["user"], username)
+    return jsonify(ok=True)
+
+
+@app.route("/api/admin/users/update", methods=["POST"])
+@admin_guard
+def api_admin_user_update():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    target = str(data.get("username", "")).strip()
+    new_name = str(data.get("new_username", "")).strip()
+    password = str(data.get("password", ""))
+    doc = db.users.find_one({"username": target})
+    if not doc:
+        return jsonify(error="Không tìm thấy tài khoản"), 404
+    upd = {}
+    if new_name and new_name != doc["username"]:
+        if doc["username"] == ADMIN_USERNAME:
+            return jsonify(error='Không thể đổi tên tài khoản "admin"'), 400
+        err = _validate_username(new_name)
+        if err:
+            return jsonify(error=err), 400
+        upd.update(username=new_name, username_lower=new_name.lower())
+    new_pv = None
+    if password:
+        err = _validate_password(password)
+        if err:
+            return jsonify(error=err), 400
+        new_pv = secrets.token_hex(4)
+        upd.update(password_hash=generate_password_hash(password), pv=new_pv, default_pw=False)
+    if not upd:
+        return jsonify(error="Không có thay đổi nào"), 400
+    upd["updated_at"] = _now()
+    try:
+        db.users.update_one({"_id": doc["_id"]}, {"$set": upd})
+    except DuplicateKeyError:
+        return jsonify(error="Tên đăng nhập đã tồn tại"), 409
+    _clear_user_cache()
+    if new_pv and doc["username"] == session.get("user"):
+        session["pv"] = new_pv                       # admin tự đổi pass → giữ phiên của chính mình
+    log.info("Admin %s sửa tài khoản %s", session["user"], target)
+    return jsonify(ok=True)
+
+
+@app.route("/api/admin/users/delete", methods=["POST"])
+@admin_guard
+def api_admin_user_delete():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    target = str((request.get_json(silent=True) or {}).get("username", "")).strip()
+    if target.lower() == ADMIN_USERNAME:
+        return jsonify(error='Không thể xóa tài khoản "admin"'), 400
+    res = db.users.delete_one({"username": target})
+    if not res.deleted_count:
+        return jsonify(error="Không tìm thấy tài khoản"), 404
+    _clear_user_cache()
+    log.info("Admin %s xóa tài khoản %s", session["user"], target)
+    return jsonify(ok=True)
+
+
+# ---------------- ADMIN: đuôi cấm / cho phép ----------------
+@app.route("/api/admin/rules", methods=["GET"])
+@admin_guard
+def api_admin_rules():
+    rules, _ = get_config(force=True)
+    return jsonify(rules={r: _rule_to_lists(rules[r]) for r in REGISTRARS})
+
+
+@app.route("/api/admin/rules/save", methods=["POST"])
+@admin_guard
+def api_admin_rules_save():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    reg = data.get("registrar")
+    if reg not in REGISTRARS:
+        return jsonify(error="Nhà cung cấp không hợp lệ"), 400
+    banned, b1 = _clean_list(data.get("banned"), normalize_suffix)
+    allowed, b2 = _clean_list(data.get("allowed"), normalize_suffix)
+    keywords, b3 = _clean_list(data.get("keywords"), normalize_keyword)
+    bad = b1 + b2 + b3
+    if bad:
+        return jsonify(error="Giá trị không hợp lệ: " + ", ".join(bad[:10])), 400
+    db.tld_rules.update_one(
+        {"registrar": reg},
+        {"$set": {"banned": banned, "allowed": allowed, "keywords": keywords,
+                  "updated_at": _now(), "updated_by": session["user"]}},
+        upsert=True,
+    )
+    _invalidate_config()
+    rules, _ = get_config(force=True)
+    log.info("Admin %s cập nhật quy tắc đuôi của %s", session["user"], reg)
+    return jsonify(ok=True, rule=_rule_to_lists(rules[reg]), summary=rules_summary())
+
+
+@app.route("/api/admin/rules/reset", methods=["POST"])
+@admin_guard
+def api_admin_rules_reset():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    reg = (request.get_json(silent=True) or {}).get("registrar")
+    if reg not in REGISTRARS:
+        return jsonify(error="Nhà cung cấp không hợp lệ"), 400
+    db.tld_rules.update_one(
+        {"registrar": reg},
+        {"$set": {**copy.deepcopy(DEFAULT_RULES[reg]), "updated_at": _now(), "updated_by": session["user"]}},
+        upsert=True,
+    )
+    _invalidate_config()
+    rules, _ = get_config(force=True)
+    log.info("Admin %s khôi phục mặc định quy tắc đuôi của %s", session["user"], reg)
+    return jsonify(ok=True, rule=_rule_to_lists(rules[reg]), summary=rules_summary())
+
+
+# ---------------- ADMIN: domain cấm (danh sách ẩn) ----------------
+@app.route("/api/admin/blocks", methods=["GET"])
+@admin_guard
+def api_admin_blocks():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    q = request.args.get("q", "").strip().lower()[:100]
+    flt = {"domain": {"$regex": re.escape(q)}} if q else {}
+    total = db.domain_blocks.count_documents(flt)
+    items = [{
+        "domain": d["domain"], "registrars": sorted(d.get("registrars") or []),
+        "added_by": d.get("added_by"), "created_at": _iso(d.get("created_at")),
+    } for d in db.domain_blocks.find(flt).sort("created_at", -1).limit(500)]
+    return jsonify(total=total, items=items)
+
+
+@app.route("/api/admin/blocks/add", methods=["POST"])
+@admin_guard
+def api_admin_blocks_add():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    regs = [r for r in REGISTRARS if r in (data.get("registrars") or [])]
+    if not regs:
+        return jsonify(error="Hãy chọn ít nhất 1 nhà cung cấp"), 400
+    domains = extract_domains(data.get("domains", ""))
+    if not domains:
+        return jsonify(error="Không có domain hợp lệ trong danh sách"), 400
+    if len(domains) > 2000:
+        return jsonify(error="Tối đa 2000 domain mỗi lần thêm"), 400
+    now = _now()
+    db.domain_blocks.bulk_write([
+        UpdateOne({"domain": d},
+                  {"$addToSet": {"registrars": {"$each": regs}},
+                   "$set": {"updated_at": now},
+                   "$setOnInsert": {"created_at": now, "added_by": session["user"]}},
+                  upsert=True)
+        for d in domains
+    ], ordered=False)
+    _invalidate_config()
+    log.info("Admin %s thêm %d domain vào danh sách cấm (%s)", session["user"], len(domains), ",".join(regs))
+    return jsonify(ok=True, count=len(domains))
+
+
+@app.route("/api/admin/blocks/remove", methods=["POST"])
+@admin_guard
+def api_admin_blocks_remove():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    domain = str(data.get("domain", "")).strip().lower()
+    reg = data.get("registrar")
+    if not domain:
+        return jsonify(error="Thiếu domain"), 400
+    if reg:
+        if reg not in REGISTRARS:
+            return jsonify(error="Nhà cung cấp không hợp lệ"), 400
+        db.domain_blocks.update_one({"domain": domain}, {"$pull": {"registrars": reg}})
+        db.domain_blocks.delete_one({"domain": domain, "registrars": {"$size": 0}})
+    else:
+        db.domain_blocks.delete_one({"domain": domain})
+    _invalidate_config()
+    return jsonify(ok=True)
+
+
+try:                       # kết nối MongoDB sớm (lỗi thì tự thử lại ở request sau)
+    get_db()
+except Exception:  # noqa: BLE001
+    log.exception("Khởi tạo MongoDB lỗi")
 
 
 if __name__ == "__main__":
