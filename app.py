@@ -343,19 +343,20 @@ def get_domain_info(domain):
     """
     Lấy status (Hold + Transfer + Lock) + Registrar + ngày ĐK.
     Phát hiện domain bị Registry Policy cấm đăng ký.
+
+    is_registered chỉ True khi có bằng chứng chắc chắn:
+    có registrar HOẶC có ngày đăng ký. Không tin HTTP 200 suông.
     """
     status_found = set()
     registrar = None
     created = None
     expires = None
-    is_registered = False
     is_restricted = False
 
     # ---------- 1. rdap.org ----------
     try:
         r = requests.get(f"https://rdap.org/domain/{domain}", timeout=10)
         if r.status_code == 200:
-            is_registered = True
             data = r.json()
             st, reg, cr, exp = _parse_rdap_json(data)
             status_found.update(st)
@@ -393,12 +394,13 @@ def get_domain_info(domain):
             r = requests.get(f"https://who-dat.as93.net/{domain}", timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                if data.get("isRegistered") is True or data.get("id") or (data.get("registrar") and data.get("registrar") not in (None, {})):
-                    is_registered = True
+                # Chỉ tin khi API khẳng định isRegistered=True kèm dữ liệu
+                if data.get("isRegistered") is True:
+                    pass  # sẽ xác nhận bằng registrar/created bên dưới
                 if "registrar" in data and data["registrar"]:
                     reg_val = data["registrar"]
-                    if isinstance(reg_val, str):
-                        registrar = registrar or reg_val
+                    if isinstance(reg_val, str) and reg_val.strip():
+                        registrar = registrar or reg_val.strip()
                     elif isinstance(reg_val, dict):
                         registrar = registrar or reg_val.get("name") or reg_val.get("organization")
                 statuses = data.get("status") or data.get("statuses") or []
@@ -439,11 +441,10 @@ def get_domain_info(domain):
             r = requests.get(f"https://rdap.cloud/api/v1/{domain}", timeout=10)
             if r.status_code == 200:
                 data = r.json()
-                is_registered = True
                 if "registrar" in data:
                     reg_val = data["registrar"]
-                    if isinstance(reg_val, str):
-                        registrar = registrar or reg_val
+                    if isinstance(reg_val, str) and reg_val.strip():
+                        registrar = registrar or reg_val.strip()
                     elif isinstance(reg_val, dict):
                         registrar = registrar or reg_val.get("name") or reg_val.get("organization")
                 statuses = data.get("status") or data.get("statuses") or []
@@ -478,27 +479,29 @@ def get_domain_info(domain):
             pass
 
     # ---------- 4. python-whois (fallback) ----------
-    if not is_restricted and (not is_registered or not registrar or not status_found or not created or not expires):
+    if not is_restricted and (not registrar or not created):
         try:
             w = whois.whois(domain)
-            if w.domain_name:
-                is_registered = True
-                raw_status = w.status
-                if isinstance(raw_status, str):
-                    raw_status = [raw_status]
-                if raw_status:
-                    for s in raw_status:
-                        key = _normalize_status(s)
-                        if key:
-                            status_found.add(key)
-                if w.registrar and not registrar:
-                    registrar = w.registrar
-                if not created and getattr(w, "creation_date", None):
-                    created = format_date_short(w.creation_date)
-                if not expires and getattr(w, "expiration_date", None):
-                    expires = format_date_short(w.expiration_date)
+            # python-whois hay trả domain_name cả khi chưa ĐK → chỉ tin nếu có registrar hoặc ngày
+            if w.registrar and not registrar:
+                registrar = w.registrar
+            if not created and getattr(w, "creation_date", None):
+                created = format_date_short(w.creation_date)
+            if not expires and getattr(w, "expiration_date", None):
+                expires = format_date_short(w.expiration_date)
+            raw_status = w.status
+            if isinstance(raw_status, str):
+                raw_status = [raw_status]
+            if raw_status:
+                for s in raw_status:
+                    key = _normalize_status(s)
+                    if key:
+                        status_found.add(key)
         except Exception:
             pass
+
+    # Chỉ coi là ĐÃ ĐĂNG KÝ khi có registrar hoặc ngày đăng ký thực sự
+    is_registered = bool(registrar or created)
 
     if is_restricted:
         return (
