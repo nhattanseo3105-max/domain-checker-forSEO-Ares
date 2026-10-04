@@ -104,27 +104,29 @@ def check_buyability(domain: str):
     # .uk và .my được phép (không cần xử lý thêm)
     results["Spaceship"] = {"ok": ss_ok, "reason": ss_reason}
 
+    # ---------- SAV (chưa có lưu ý, luôn cho phép) ----------
+    results["SAV"] = {"ok": True, "reason": ""}
+
     can_buy = any(r["ok"] for r in results.values())
     return results, can_buy
 
 
 def format_buyability_html(results, can_buy):
-    """Tạo HTML badge tổng + chi tiết từng registrar"""
+    """Tạo HTML badge tổng. Chỉ hiện registrar BỊ CẤM, không hiện registrar được phép."""
     if can_buy:
         overall = "<span class='badge badge-success'>CÓ THỂ MUA</span>"
     else:
         overall = "<span class='badge badge-danger'>KHÔNG MUA ĐƯỢC</span>"
 
-    details = []
+    banned = []
     for name, info in results.items():
-        if info["ok"]:
-            details.append(f"<span class='badge badge-success' title='Được phép'>{name} ✓</span>")
-        else:
-            details.append(
+        if not info["ok"]:
+            banned.append(
                 f"<span class='badge badge-danger' title='{info['reason']}'>{name} ✗</span>"
             )
-    detail_html = " ".join(details)
-    return overall + "<br><div class='buy-detail'>" + detail_html + "</div>"
+    if banned:
+        return overall + "<br><div class='buy-detail'>" + " ".join(banned) + "</div>"
+    return overall
 
 
 # ==========================================
@@ -461,7 +463,11 @@ def get_domain_info(domain):
         )
 
     if not is_registered:
-        return "Chưa đăng ký / Ẩn thông tin", "Không có dữ liệu", None
+        return (
+            "<span class='badge badge-success'>Chưa đăng ký</span>",
+            "<span class='badge badge-success'>Chưa đăng ký</span>",
+            None,
+        )
 
     final_status = format_status_display(status_found)
     final_registrar = registrar if registrar else "Không xác định"
@@ -960,6 +966,10 @@ HTML_TEMPLATE = """
                     <span>Cấm: .de<br>
                     Cho phép: .uk · .my</span>
                 </div>
+                <div class="rule-item">
+                    <strong>SAV</strong>
+                    <span>Chưa có lưu ý · luôn cho phép</span>
+                </div>
             </div>
         </div>
 
@@ -1028,8 +1038,8 @@ HTML_TEMPLATE = """
                             <span>Sắp xóa hoặc đang chuộc</span>
                         </div>
                         <div class="legend-row" data-key="chuaDK">
-                            <span class="badge badge-muted">Chưa đăng ký / Ẩn thông tin</span>
-                            <span>Domain chưa đăng ký hoặc WHOIS bị ẩn</span>
+                            <span class="badge badge-success">Chưa đăng ký</span>
+                            <span>Domain chưa đăng ký · có thể mua</span>
                         </div>
                         <div class="legend-row" data-key="restricted">
                             <span class="badge badge-danger">Không thể đăng ký</span>
@@ -1155,16 +1165,13 @@ HTML_TEMPLATE = """
         }
 
         function isFailedResult(data, options) {
+            // Chỉ coi là lỗi khi backend trả về lỗi thật sự (network / exception).
+            // Không check được registrar / chưa đăng ký → KHÔNG tính lỗi.
             if (!data) return true;
-            if (options.check_registrar) {
-                const reg = (data.registrar || "").toString().toLowerCase();
-                if (reg.includes("không có dữ liệu") || reg.includes("không xác định") || reg.includes("lỗi") || reg === "") return true;
-            }
-            if (options.check_hold) {
-                const st = (data.status || "").toString().toLowerCase();
-                if (st.includes("lỗi") || st.includes("chưa đăng ký")) return true;
-            }
-            if (data.cf_add_status && data.cf_add_status.toString().toLowerCase().includes("lỗi")) return true;
+            const reg = (data.registrar || "").toString().toLowerCase();
+            const st = (data.status || "").toString().toLowerCase();
+            if (reg.includes("lỗi") || st === "lỗi" || st.includes("lỗi backend")) return true;
+            if (data.cf_add_status && data.cf_add_status.toString().toLowerCase().includes("lỗi call")) return true;
             return false;
         }
 
@@ -1293,8 +1300,12 @@ HTML_TEMPLATE = """
                     collectLegendKeysFromResult(data, options);
 
                     let registrarText = data.registrar || "";
-                    if (["Không có dữ liệu", "Không xác định", "Bỏ qua"].includes(registrarText)) {
+                    // "Chưa đăng ký" đã có badge xanh từ backend → giữ nguyên
+                    // Chỉ tô đỏ khi thật sự lỗi / không xác định
+                    if (registrarText === "Không xác định" || registrarText === "Bỏ qua") {
                         registrarText = `<span class="error-cell">${registrarText}</span>`;
+                    } else if (registrarText === "Không có dữ liệu") {
+                        registrarText = `<span class="badge badge-success">Chưa đăng ký</span>`;
                     }
 
                     let datesText = "—";
