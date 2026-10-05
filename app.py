@@ -11,6 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from functools import wraps
 
 import requests
@@ -59,6 +60,13 @@ def _float_env(name, default):
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_MIN_INTERVAL = _float_env("CF_MIN_INTERVAL", 0.35)      # giây giữa 2 lần gọi CF (tránh rate limit)
+
+# GoDaddy API v3 (chỉ đọc) — token đặt ở biến môi trường GODADDY_PAT (scope domains.domain:read)
+GODADDY_PAT = os.environ.get("GODADDY_PAT", "").strip()
+GODADDY_MIN_INTERVAL = _float_env("GODADDY_MIN_INTERVAL", 1.1)   # GoDaddy giới hạn 60 req/phút/token
+GD_VAT_RATE = _float_env("GD_VAT_RATE", 0.08)              # VAT cộng sẵn vào giá (8%)
+GD_USD_VND = _float_env("GD_USD_VND", 27000)               # tỷ giá quy đổi 1 USD = ? VNĐ
+GD_CACHE_TTL = _int_env("GD_CACHE_TTL", 300)               # cache giá trong RAM (giây)
 
 IS_RENDER = bool(os.environ.get("RENDER"))
 _secret = os.environ.get("SECRET_KEY", "")
@@ -1311,6 +1319,143 @@ def check_transfer_eligibility(domain):
 
 
 # ==========================================
+# 2c. GIÁ DOMAIN MUA MỚI (1 NĂM) TỪ GODADDY API v3
+# ==========================================
+GD_CHECK_URL = "https://api.godaddy.com/v3/domains/check-availability"
+_gd_lock = threading.Lock()
+_gd_last_call = 0.0
+_gd_block_until = 0.0            # sau khi bị 429: tạm dừng gọi đến mốc này (monotonic)
+_gd_cache = {}
+_gd_cache_lock = threading.Lock()
+
+
+def _gd_throttle():
+    """Giãn cách các lần gọi GoDaddy giữa mọi thread (giới hạn 60 req/phút/token)."""
+    global _gd_last_call
+    with _gd_lock:
+        wait = GODADDY_MIN_INTERVAL - (time.monotonic() - _gd_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _gd_last_call = time.monotonic()
+
+
+def _gd_result(state, html_, failed=False, **extra):
+    out = {"state": state, "failed": failed, "result_html": html_,
+           "price_usd": "", "price_vat": "", "price_vnd": ""}
+    out.update(extra)
+    return out
+
+
+def _fmt_usd(amount):
+    return "$" + format(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ",.2f")
+
+
+def _fmt_vnd(amount):
+    return format(int(amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP)), ",").replace(",", ".") + " ₫"
+
+
+def _gd_pick_one_year(prices):
+    """Lấy mục giá đăng ký 1 năm (period = 1, term = YEAR) trong prices[]."""
+    for p in prices or []:
+        try:
+            if int(p.get("period")) == 1 and str(p.get("term", "YEAR")).upper() == "YEAR":
+                return p
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def _gd_build_price(data):
+    """JSON check-availability → kết quả hiển thị. Giá API tính theo cent."""
+    domain_note = ""
+    inventory = str(data.get("inventory") or "")
+    if inventory and inventory.upper() != "REGISTRY":
+        domain_note = "<div class='buy-reason'>Nguồn: " + html.escape(inventory) + " (có thể là domain premium)</div>"
+
+    if not data.get("available"):
+        return _gd_result("unavailable", _badge("badge-muted", "KHÔNG KHẢ DỤNG") +
+                          "<div class='buy-reason'>GoDaddy báo domain không đăng ký mới được</div>")
+
+    one = _gd_pick_one_year(data.get("prices"))
+    price = (one or {}).get("price") or {}
+    try:
+        cents = Decimal(str(price.get("value")))
+    except Exception:  # noqa: BLE001
+        cents = None
+    if one is None or cents is None:
+        return _gd_result("noprice", _badge("badge-warning", "KHÔNG CÓ GIÁ 1 NĂM") + domain_note)
+
+    cur = str(price.get("currencyCode") or "USD").upper()
+    base = cents / Decimal(100)
+    with_vat = base * (Decimal(1) + Decimal(str(GD_VAT_RATE)))
+    if cur != "USD":      # chỉ quy đổi tỷ giá khi giá gốc là USD
+        return _gd_result("ok", _badge("badge-success", "CÓ GIÁ") + domain_note +
+                          "<div class='buy-reason'>Đơn vị " + html.escape(cur) + " — chưa quy đổi VNĐ</div>",
+                          price_usd=f"{base:.2f} {cur}", price_vat=f"{with_vat:.2f} {cur}")
+    vnd = with_vat * Decimal(str(GD_USD_VND))
+    return _gd_result("ok", _badge("badge-success", "CÓ GIÁ") + domain_note,
+                      price_usd=_fmt_usd(base), price_vat=_fmt_usd(with_vat), price_vnd=_fmt_vnd(vnd))
+
+
+def check_godaddy_price(domain):
+    """Giá đăng ký mới 1 năm trên GoDaddy (API v3, chỉ đọc) + VAT + quy đổi VNĐ."""
+    global _gd_block_until
+    if not GODADDY_PAT:
+        return _gd_result("nokey", _badge("badge-muted", "Thiếu API GoDaddy"))
+
+    now = time.monotonic()
+    with _gd_cache_lock:
+        hit = _gd_cache.get(domain)
+        if hit and hit[0] > now:
+            return dict(hit[1])
+    if _gd_block_until > now:
+        return _gd_result("ratelimit", _badge("badge-warning", "GoDaddy giới hạn tốc độ — thử lại sau"), failed=True)
+
+    headers = {"Authorization": f"Bearer {GODADDY_PAT}", "Accept": "application/json",
+               "User-Agent": HTTP_HEADERS["User-Agent"]}
+    try:
+        _gd_throttle()
+        r = requests.get(GD_CHECK_URL, headers=headers, params={"domain": domain}, timeout=(5, 12))
+    except requests.RequestException as e:
+        log.warning("GoDaddy lỗi %s: %s", domain, type(e).__name__)
+        return _gd_result("error", _badge("badge-danger", "Lỗi gọi API GoDaddy"), failed=True)
+
+    if r.status_code == 429:
+        try:
+            wait = min(max(int(r.headers.get("Retry-After", "30")), 1), 120)
+        except ValueError:
+            wait = 30
+        _gd_block_until = time.monotonic() + wait
+        log.warning("GoDaddy 429 — tạm dừng %ss", wait)
+        return _gd_result("ratelimit", _badge("badge-warning", "GoDaddy giới hạn tốc độ — thử lại sau"), failed=True)
+    if r.status_code == 401:
+        log.error("GoDaddy 401: GODADDY_PAT sai hoặc đã hết hạn / bị thu hồi")
+        return _gd_result("auth", _badge("badge-danger", "Token GoDaddy không hợp lệ"), failed=True)
+    if r.status_code == 403:
+        log.error("GoDaddy 403: token thiếu scope domains.domain:read hoặc tài khoản chưa đủ điều kiện")
+        return _gd_result("auth", _badge("badge-danger", "Token thiếu quyền / tài khoản chưa đủ điều kiện"), failed=True)
+    if r.status_code == 400:
+        return _gd_result("invalid", _badge("badge-muted", "GoDaddy từ chối domain này"))
+    if r.status_code >= 500:
+        return _gd_result("error", _badge("badge-warning", "GoDaddy quá tải — thử lại"), failed=True)
+    if r.status_code != 200:
+        log.warning("GoDaddy HTTP %s cho %s", r.status_code, domain)
+        return _gd_result("error", _badge("badge-danger", f"Lỗi GoDaddy HTTP {r.status_code}"), failed=True)
+    try:
+        data = r.json()
+    except ValueError:
+        return _gd_result("error", _badge("badge-muted", "GoDaddy trả phản hồi không hợp lệ"), failed=True)
+
+    out = _gd_build_price(data if isinstance(data, dict) else {})
+    if not out["failed"]:
+        with _gd_cache_lock:
+            if len(_gd_cache) > 5000:
+                _gd_cache.clear()
+            _gd_cache[domain] = (time.monotonic() + GD_CACHE_TTL, dict(out))
+    return out
+
+
+# ==========================================
 # 3. GIAO DIỆN WEB
 # ==========================================
 HTML_TEMPLATE = """
@@ -2076,23 +2221,47 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- ================= TAB: KIỂM TRA GIÁ (CHỈ DẪN LINK) ================= -->
+        <!-- ================= TAB: KIỂM TRA GIÁ GODADDY (API) ================= -->
         <div class="tab-panel" id="tab-price">
             <div class="note-box">
                 <span class="note-icon">⚠️</span>
-                <div>Nếu giá domain rẻ bất thường, vui lòng liên hệ IT mua domain để được hỗ trợ kiểm tra giá</div>
+                <div>
+                    <strong>Giá đăng ký mới 1 năm trên GoDaddy</strong>, đã cộng sẵn <b>VAT {{ gd_vat_pct }}%</b> và quy đổi theo tỷ giá <b>1 USD = {{ gd_rate }} VNĐ</b>.
+                    Giá lấy từ API GoDaddy nên chỉ mang tính tham khảo (giá chính thức chốt lúc mua).
+                    Nếu giá domain rẻ bất thường, vui lòng liên hệ IT mua domain để được hỗ trợ kiểm tra giá.
+                </div>
+            </div>
+            <div class="card">
+                <textarea id="gdList" placeholder="Nhập domain cần xem giá (mỗi dòng 1 domain)&#10;example.com&#10;example.net"></textarea>
+                <div class="action-bar">
+                    <button id="btnGd" class="btn-primary" onclick="startPrice(false)">▶ Kiểm tra giá</button>
+                    <button id="btnGdRetry" class="btn-warning" onclick="startPrice(true)" disabled>↻ Retry lỗi</button>
+                    <div class="delay-box">
+                        <label for="gdDelay">Delay</label>
+                        <input type="number" id="gdDelay" value="0" min="0" step="100" title="ms giữa mỗi domain (server đã tự giãn cách để không vượt 60 req/phút của GoDaddy)">
+                        <span>ms</span>
+                    </div>
+                </div>
+                <div class="progress" id="gdProgress">Sẵn sàng kiểm tra</div>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table>
+                        <thead><tr><th>Domain</th><th>Kết quả</th><th>Giá gốc 1 năm (USD)</th><th>Giá + VAT {{ gd_vat_pct }}% (USD)</th><th>Quy đổi (VNĐ)</th></tr></thead>
+                        <tbody id="gdBody"></tbody>
+                    </table>
+                </div>
             </div>
             <div class="price-grid">
                 <div class="card price-card">
-                    <h3>🛒 Giá domain mua mới trên GoDaddy</h3>
-                    <p>Mở trang Bulk Domain Search của GoDaddy ở tab mới để kiểm tra giá mua mới.
-                       Đây chỉ là liên kết sang GoDaddy — việc kiểm tra giá thực hiện trên GoDaddy, không thực hiện trên website này.</p>
+                    <h3>🛒 Xem trực tiếp trên GoDaddy</h3>
+                    <p>Liên kết dự phòng khi API lỗi hoặc cần đối chiếu giá: mở Bulk Domain Search của GoDaddy ở tab mới.</p>
                     <a class="link-btn" href="https://www.godaddy.com/en/domains/bulk-domain-search" target="_blank" rel="noopener noreferrer">↗ Mở GoDaddy Bulk Domain Search</a>
                 </div>
                 <div class="card price-card">
                     <h3>⇄ Giá transfer về GoDaddy</h3>
                     <p>Mở trang Domain Transfer của GoDaddy ở tab mới để kiểm tra giá transfer.
-                       Đây chỉ là liên kết sang GoDaddy — việc kiểm tra giá thực hiện trên GoDaddy, không thực hiện trên website này.</p>
+                       Đây chỉ là liên kết sang GoDaddy — giá transfer không kiểm tra trên website này.</p>
                     <a class="link-btn" href="https://www.godaddy.com/en/domains/domain-transfer" target="_blank" rel="noopener noreferrer">↗ Mở GoDaddy Domain Transfer</a>
                 </div>
             </div>
@@ -2575,6 +2744,60 @@ HTML_TEMPLATE = """
             btnRetry.disabled = tfFailed.length === 0;
         }
 
+        // ---- TAB GIÁ GODADDY (API) ----
+        let gdFailed = [];
+        async function startPrice(isRetry) {
+            const btn = el('btnGd'), btnRetry = el('btnGdRetry'), tbody = el('gdBody');
+            let domains;
+            if (isRetry) {
+                domains = gdFailed.slice();
+                if (!domains.length) { alert('Không có domain lỗi để retry!'); return; }
+            } else {
+                domains = parseDomains(el('gdList').value);
+                if (!domains.length) { alert('Vui lòng nhập ít nhất 1 domain hợp lệ!'); return; }
+                gdFailed = [];
+                tbody.innerHTML = '';
+            }
+            const delay = Math.max(0, parseInt(el('gdDelay').value) || 0);
+            btn.disabled = true; btnRetry.disabled = true;
+            let completed = 0;
+            const total = domains.length;
+            for (const domain of domains) {
+                el('gdProgress').innerHTML = '<span class="progress-dot"></span> Đang xử lý ' + (completed + 1) + '/' + total +
+                    ' — <b style="color:#93c5fd">' + esc(domain) + '</b>';
+                let row = el('gd-' + domain);
+                if (!row) { row = document.createElement('tr'); row.id = 'gd-' + domain; tbody.appendChild(row); }
+                row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td><td colspan="4" class="skipped">Đang lấy giá…</td>';
+                try {
+                    const r = await fetch('/api/price-check', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+                        body: JSON.stringify({ domain })
+                    });
+                    if (r.status === 401 || r.status === 403) { window.location.href = '/login'; return; }
+                    if (r.status === 429) { await sleep(5000); throw new Error('rate limited'); }
+                    if (!r.ok) throw new Error('Server error');
+                    const d = await r.json();
+                    row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td>' +
+                        '<td class="buy-cell">' + (d.result_html || '') + '</td>' +
+                        '<td>' + (d.price_usd ? esc(d.price_usd) : '—') + '</td>' +
+                        '<td>' + (d.price_vat ? esc(d.price_vat) : '—') + '</td>' +
+                        '<td><b>' + (d.price_vnd ? esc(d.price_vnd) : '—') + '</b></td>';
+                    if (d.failed) { if (!gdFailed.includes(domain)) gdFailed.push(domain); }
+                    else gdFailed = gdFailed.filter(x => x !== domain);
+                } catch (e) {
+                    row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td><td colspan="4" class="error-cell">Lỗi network / quá tải — thử lại sau</td>';
+                    if (!gdFailed.includes(domain)) gdFailed.push(domain);
+                }
+                completed++;
+                if (completed < total && delay > 0) await sleep(delay);
+            }
+            el('gdProgress').innerHTML = '✓ Hoàn thành ' + completed + '/' + total + ' domain' +
+                (gdFailed.length ? ' · <span style="color:#f87171">' + gdFailed.length + ' lỗi</span>' : '');
+            btn.disabled = false;
+            btnRetry.disabled = gdFailed.length === 0;
+        }
+
         // ---- ADMIN: helper gọi API ----
         async function adminApi(url, body) {
             const opt = { method: body === undefined ? 'GET' : 'POST', headers: { 'X-CSRF-Token': CSRF_TOKEN } };
@@ -2904,6 +3127,8 @@ def index():
     return render_template_string(
         HTML_TEMPLATE, username=session["user"], csrf_token=session["csrf"],
         is_admin=is_admin(), registrars=REGISTRARS, rules_summary=rules_summary(),
+        gd_vat_pct=("%g" % (GD_VAT_RATE * 100)),
+        gd_rate=format(int(round(GD_USD_VND)), ",").replace(",", "."),
     )
 
 
@@ -2994,6 +3219,26 @@ def api_transfer_check():
             "domain": domain or "Unknown", "eligible": False, "failed": True, "age_days": None,
             "reasons": [], "registrar": "Lỗi", "status": "Lỗi", "created": None, "expires": None,
             "result_html": _badge("badge-danger", "Lỗi"),
+        }), 500
+
+
+@app.route("/api/price-check", methods=["POST"])
+@api_guard
+def api_price_check():
+    domain = ""
+    try:
+        data = request.get_json(silent=True) or {}
+        domain = str(data.get("domain", "")).strip().lower().rstrip(".")
+        if not DOMAIN_RE.match(domain):
+            return jsonify(error="Domain không hợp lệ", failed=True), 400
+        res = check_godaddy_price(domain)
+        res["domain"] = domain
+        return jsonify(res)
+    except Exception:  # noqa: BLE001
+        log.exception("Lỗi kiểm tra giá %r", domain)
+        return jsonify({
+            "domain": domain or "Unknown", "state": "error", "failed": True,
+            "result_html": _badge("badge-danger", "Lỗi"), "price_usd": "", "price_vat": "", "price_vnd": "",
         }), 500
 
 
