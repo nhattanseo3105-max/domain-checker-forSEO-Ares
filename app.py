@@ -21,10 +21,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
+    from bson import ObjectId
     from pymongo import MongoClient, UpdateOne
     from pymongo.errors import DuplicateKeyError, PyMongoError
 except ImportError:  # chưa cài pymongo → chỉ dùng được APP_USERS + quy tắc mặc định
-    MongoClient = UpdateOne = None
+    MongoClient = UpdateOne = ObjectId = None
 
     class PyMongoError(Exception):
         pass
@@ -134,6 +135,11 @@ DEFAULT_ADMIN_PASSWORD = os.environ.get("ADMIN_DEFAULT_PASSWORD") or "ares#3105"
 
 REGISTRARS = ["Namecheap", "GoDaddy", "Dynadot", "Spaceship", "SAV"]
 
+KW_ACTIVE, KW_DISABLED = "active", "disabled"          # trạng thái keyword cấm theo nhà cung cấp
+KW_MAX_PER_PROVIDER = 5000
+NOTICE_DEFAULT_TITLE = "Thông báo từ admin"
+NOTICE_TITLE_MAX, NOTICE_CONTENT_MAX = 120, 5000
+
 # Cấu hình mặc định (khớp logic cũ). Admin có thể chỉnh trong tab "Đuôi cấm / cho phép".
 #   banned   : ".uk" = cả đuôi .uk và mọi .xx.uk · ".co.uk" = đúng đuôi đó · "*.uk" = mọi .xx.uk (không gồm .uk thuần)
 #   allowed  : đuôi cho phép đặc biệt (thắng khi cùng mức hoặc cụ thể hơn đuôi bị cấm)
@@ -162,10 +168,27 @@ def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if isinstance(dt, datetime) else None
 
 
+def _ensure_extra_schema(db):
+    """Index cho 2 tính năng: từ khóa cấm theo nhà cung cấp + thông báo popup.
+    Chỉ TẠO MỚI collection/index (idempotent, không đụng dữ liệu cũ). Lỗi ở đây chỉ được log,
+    không được làm hỏng kết nối DB / đăng nhập của phần còn lại."""
+    try:
+        # 1 keyword (đã normalize) chỉ xuất hiện 1 lần trong cùng 1 nhà cung cấp
+        db.provider_banned_keywords.create_index(
+            [("provider", 1), ("normalized_keyword", 1)], unique=True, name="uniq_provider_keyword")
+        # tối đa 1 thông báo đang bật tại một thời điểm (ép ở tầng DB, chống race giữa 2 request)
+        db.admin_notifications.create_index(
+            "is_active", unique=True, partialFilterExpression={"is_active": True}, name="uniq_active_notice")
+    except PyMongoError as e:
+        log.error("Không tạo được index cho keyword cấm / thông báo (tính năng vẫn chạy, "
+                  "nhưng hãy kiểm tra quyền createIndex): %s", e)
+
+
 def _ensure_schema(db):
     db.users.create_index("username_lower", unique=True)
     db.domain_blocks.create_index("domain", unique=True)
     db.tld_rules.create_index("registrar", unique=True)
+    _ensure_extra_schema(db)
     now = _now()
     if db.users.find_one({"username_lower": ADMIN_USERNAME}, {"_id": 1}) is None:
         try:
@@ -361,6 +384,32 @@ def normalize_keyword(tok):
     return f"{tld}:{kw}"
 
 
+def clean_banned_keyword(raw):
+    """Keyword cấm theo nhà cung cấp → (keyword hiển thị, keyword normalize, lỗi).
+    Trim; normalize = chữ thường nên "Bitcoin" và "bitcoin" là CÙNG một keyword.
+    Keyword được so khớp với tên domain nên chỉ nhận a-z, 0-9 và dấu gạch ngang (giống từ khóa đuôi:từ khóa)."""
+    if not isinstance(raw, str):
+        return None, None, "Keyword không hợp lệ"
+    kw = raw.strip()
+    if not kw:
+        return None, None, "Keyword không được để trống"
+    norm = kw.lower()
+    if not _KEYWORD_RE.match(norm):
+        return None, None, "Keyword chỉ gồm chữ a-z, số 0-9 và dấu gạch ngang (-), tối đa 63 ký tự, không có khoảng trắng"
+    return kw, norm, None
+
+
+def _banned_keyword_hit(domain, full_suffix, keywords):
+    """Keyword (nếu có) nằm trong phần TÊN của domain (bỏ đuôi, vd 'india-shop' của 'india-shop.in')."""
+    if not keywords:
+        return ""
+    name = domain[:-len(full_suffix)] if full_suffix and domain.endswith(full_suffix) else domain
+    for kw in keywords:
+        if kw in name:
+            return "Tên domain chứa từ khóa bị cấm"          # không lộ keyword cho user thường
+    return ""
+
+
 def _clean_list(items, fn):
     good, bad = [], []
     for tok in _split_tokens(items):
@@ -403,7 +452,7 @@ def _default_config():
     return ({r: _compile_rule(**DEFAULT_RULES[r]) for r in REGISTRARS}, {})
 
 
-_cfg = {"ts": -1e9, "rules": None, "blocks": None}
+_cfg = {"ts": -1e9, "rules": None, "blocks": None, "kw": None}   # kw: {registrar: tuple(keyword đang bật)}
 _cfg_lock = threading.Lock()
 CFG_TTL = 20
 
@@ -423,6 +472,8 @@ def get_config(force=False):
         if db is None:
             if _cfg["rules"] is None:
                 _cfg["rules"], _cfg["blocks"] = _default_config()
+            if _cfg["kw"] is None:
+                _cfg["kw"] = {}
             _cfg["ts"] = now - CFG_TTL + 5                       # thử lại sau ~5 giây
             return _cfg["rules"], _cfg["blocks"]
         try:
@@ -435,13 +486,25 @@ def get_config(force=False):
             for doc in db.domain_blocks.find({}, {"domain": 1, "registrars": 1}):
                 if doc.get("registrars"):
                     blocks[doc["domain"]] = set(doc["registrars"])
-            _cfg.update(rules=rules, blocks=blocks, ts=now)
+            kw_acc = {}
+            for doc in db.provider_banned_keywords.find({"status": KW_ACTIVE}, {"provider": 1, "normalized_keyword": 1}):
+                if doc.get("provider") in rules and doc.get("normalized_keyword"):
+                    kw_acc.setdefault(doc["provider"], []).append(doc["normalized_keyword"])
+            _cfg.update(rules=rules, blocks=blocks, kw={p: tuple(v) for p, v in kw_acc.items()}, ts=now)
         except PyMongoError as e:
             log.error("Lỗi nạp cấu hình từ MongoDB: %s", e)
             if _cfg["rules"] is None:
                 _cfg["rules"], _cfg["blocks"] = _default_config()
+            if _cfg["kw"] is None:
+                _cfg["kw"] = {}
             _cfg["ts"] = now - CFG_TTL + 5
         return _cfg["rules"], _cfg["blocks"]
+
+
+def get_provider_keywords():
+    """→ {registrar: tuple(keyword đã normalize, đang bật)} — dùng chung cache với get_config()."""
+    get_config()
+    return _cfg["kw"] or {}
 
 
 def rules_summary():
@@ -493,6 +556,7 @@ class RateLimiter:
 login_limiter = RateLimiter()
 api_limiter = RateLimiter()
 admin_limiter = RateLimiter()
+notice_limiter = RateLimiter()
 
 
 def _csrf_ok(token):
@@ -552,6 +616,25 @@ def admin_guard(view):
         if admin_limiter.blocked(key, 120, 60):
             return jsonify(error="Thao tác quá nhanh, thử lại sau"), 429
         admin_limiter.hit(key, 60)
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def user_read_guard(view):
+    """API chỉ-đọc cho mọi người dùng ĐÃ ĐĂNG NHẬP (vd lấy thông báo popup).
+    Có limiter riêng để không ăn vào hạn mức /api/check của user."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        user = session.get("user")
+        if not auth_ready() or not user:
+            return jsonify(success=False, error="unauthorized"), 401
+        if not session_valid():
+            session.clear()
+            return jsonify(success=False, error="unauthorized"), 401
+        key = "notice:" + user
+        if notice_limiter.blocked(key, 60, 60):
+            return jsonify(success=False, error="rate_limited"), 429
+        notice_limiter.hit(key, 60)
         return view(*args, **kwargs)
     return wrapper
 
@@ -659,11 +742,14 @@ def check_buyability(domain: str):
     full_suffix, last_tld = get_tld_parts(domain)
     rules, blocks = get_config()
     blocked_regs = blocks.get(domain, ())
+    kw_map = get_provider_keywords()
     results = {}
     for reg in REGISTRARS:
         reason = _rule_hit(domain, full_suffix, last_tld, rules[reg])
         if not reason and reg in blocked_regs:
             reason = "Domain nằm trong danh sách cấm nội bộ"
+        if not reason:
+            reason = _banned_keyword_hit(domain, full_suffix, kw_map.get(reg))
         results[reg] = {"ok": not reason, "reason": reason}
     return results, any(r["ok"] for r in results.values())
 
@@ -2006,6 +2092,63 @@ HTML_TEMPLATE = """
         }
         a.link-btn:hover { transform: translateY(-1px); }
         .user-box .badge { font-size: 10.5px; }
+
+        /* ===== Popup thông báo (hiển thị cho mọi user khi vào / F5 trang) ===== */
+        .notice-overlay {
+            position: fixed; inset: 0; z-index: 2000; background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(4px);
+            opacity: 0; visibility: hidden; transition: opacity 0.25s ease, visibility 0s linear 0.25s;
+        }
+        .notice-overlay.show { opacity: 1; visibility: visible; transition: opacity 0.25s ease; }
+        .notice-dialog {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%) scale(0.94);
+            width: min(480px, calc(100vw - 32px)); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px);
+            display: flex; flex-direction: column; text-align: center; padding: 26px 24px 22px;
+            background: var(--bg-card); border: 1px solid var(--border-light); border-radius: 16px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5); transition: transform 0.25s ease;
+        }
+        .notice-overlay.show .notice-dialog { transform: translate(-50%, -50%) scale(1); }
+        .notice-icon { font-size: 30px; line-height: 1; margin-bottom: 10px; flex-shrink: 0; }
+        .notice-title { font-size: 1.15rem; font-weight: 700; margin-bottom: 12px; flex-shrink: 0; overflow-wrap: anywhere; }
+        .notice-body {
+            flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; white-space: pre-wrap;
+            overflow-wrap: anywhere; font-size: 14px; line-height: 1.65; color: var(--text-muted);
+            scrollbar-width: thin; scrollbar-color: var(--border-light) transparent;
+        }
+        .notice-count { margin-top: 16px; font-size: 12.5px; color: var(--text-dim); flex-shrink: 0; }
+        .notice-close { margin: 12px auto 0; justify-content: center; min-width: 120px; flex-shrink: 0; }
+        @media (prefers-reduced-motion: reduce) {
+            .notice-overlay, .notice-overlay.show, .notice-dialog { transition: none; }
+        }
+
+{% if is_admin %}
+        /* ===== Admin: toast + các tab quản trị mới ===== */
+        .toast-box {
+            position: fixed; right: 18px; bottom: 18px; z-index: 3000; display: flex; flex-direction: column;
+            gap: 8px; max-width: calc(100vw - 36px); pointer-events: none;
+        }
+        .toast {
+            pointer-events: auto; background: var(--bg-elevated); border: 1px solid var(--border-light);
+            border-left: 3px solid var(--primary); color: var(--text); padding: 10px 14px; font-size: 13px;
+            border-radius: var(--radius-sm); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); animation: toastIn 0.2s ease;
+        }
+        .toast.ok { border-left-color: var(--success); }
+        .toast.err { border-left-color: var(--danger); color: #fca5a5; }
+        @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+        .kw-provs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        .kw-prov {
+            background: var(--bg); color: var(--text-muted); border: 1px solid var(--border-light);
+            padding: 8px 14px; font-size: 13.5px;
+        }
+        .kw-prov:hover { color: var(--text); background: var(--bg-elevated); }
+        .kw-prov.active { color: #fff; border-color: var(--primary); background: rgba(59, 130, 246, 0.15); }
+        .kw-count { background: var(--bg-elevated); border-radius: 10px; padding: 0 7px; font-size: 11.5px; color: var(--text-muted); }
+        select.field { cursor: pointer; }
+        textarea.field-text { font-family: inherit; font-size: 14px; }
+        .nt-content { white-space: normal; max-width: 360px; overflow-wrap: anywhere; color: var(--text-muted); }
+        .nt-current { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+        .nt-current > div { flex: 1; min-width: 220px; }
+        .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+{% endif %}
     </style>
 </head>
 <body>
@@ -2036,6 +2179,8 @@ HTML_TEMPLATE = """
             <span class="tab-sep"></span>
             <button class="tab-btn" data-tab="rules">⚙ Đuôi cấm / cho phép</button>
             <button class="tab-btn" data-tab="blocks">🚫 Domain cấm (ẩn)</button>
+            <button class="tab-btn" data-tab="keywords">🔤 Cấm Keyword</button>
+            <button class="tab-btn" data-tab="notices">📢 Thông báo</button>
             <button class="tab-btn" data-tab="users">👥 Tài khoản</button>
             {% endif %}
         </div>
@@ -2311,6 +2456,94 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <!-- ================= TAB (ADMIN): CẤM KEYWORD THEO NHÀ CUNG CẤP ================= -->
+        <div class="tab-panel" id="tab-keywords">
+            <div class="note-box">
+                <span class="note-icon">🔤</span>
+                <div>
+                    <strong>Keyword bị cấm theo từng nhà cung cấp.</strong>
+                    Domain có <b>tên</b> (phần trước đuôi) chứa keyword đang bật sẽ bị tính là KHÔNG MUA ĐƯỢC tại đúng nhà cung cấp đó —
+                    keyword của nhà cung cấp này không áp dụng cho nhà cung cấp khác. Không phân biệt hoa/thường (<code>Bitcoin</code> = <code>bitcoin</code>).
+                    Danh sách chỉ admin xem và chỉnh sửa.
+                </div>
+            </div>
+            <div class="card">
+                <div class="section-title">Nhà cung cấp</div>
+                <div class="kw-provs" id="kwProviders"></div>
+            </div>
+            <div class="card">
+                <div class="section-title">Thêm keyword cấm</div>
+                <form id="kwForm" class="form-row" style="margin-top:12px" autocomplete="off">
+                    <div class="form-group" style="max-width:220px"><label for="kwProviderSel">Nhà cung cấp</label>
+                        <select class="field" id="kwProviderSel"></select></div>
+                    <div class="form-group"><label for="kwInput">Keyword</label>
+                        <input class="field field-mono" id="kwInput" maxlength="63" autocomplete="off" placeholder="vd: bitcoin"></div>
+                    <div class="form-group" style="max-width:170px;min-width:150px"><label for="kwStatusSel">Trạng thái</label>
+                        <select class="field" id="kwStatusSel"><option value="active">Đang cấm</option><option value="disabled">Tạm tắt</option></select></div>
+                    <button class="btn-primary" id="btnKwAdd" type="submit">+ Thêm keyword</button>
+                </form>
+                <div class="msg" id="kwMsg"></div>
+            </div>
+            <div class="card">
+                <div class="form-row">
+                    <div class="form-group"><label for="kwSearch">Tìm keyword của nhà cung cấp đang chọn</label>
+                        <input class="field field-mono" id="kwSearch" placeholder="vd: bitcoin" autocomplete="off"></div>
+                    <button class="btn-secondary" id="btnKwReload" type="button">↻ Tải lại</button>
+                </div>
+                <div class="hint" id="kwCount"></div>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table class="tbl-sm">
+                        <thead><tr><th>Keyword</th><th>Trạng thái</th><th>Thêm bởi</th><th>Cập nhật</th><th></th></tr></thead>
+                        <tbody id="kwBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): THÔNG BÁO POPUP ================= -->
+        <div class="tab-panel" id="tab-notices">
+            <div class="note-box">
+                <span class="note-icon">📢</span>
+                <div>
+                    <strong>Thông báo popup cho người dùng.</strong>
+                    Thông báo đang bật sẽ hiện giữa màn hình mỗi khi người dùng vào site hoặc tải lại trang (F5), tự đóng sau 5 giây.
+                    Chỉ có <b>1 thông báo</b> được bật tại một thời điểm — bật thông báo mới sẽ tự tắt thông báo đang bật trước đó.
+                </div>
+            </div>
+            <div class="card">
+                <div class="section-title">Thông báo hiện tại</div>
+                <div id="ntCurrent" style="margin-top:10px"><div class="skipped">Đang tải…</div></div>
+            </div>
+            <div class="card">
+                <div class="section-title" id="ntFormTitle">Tạo thông báo mới</div>
+                <div class="form-group" style="margin-top:12px"><label for="ntTitle">Title</label>
+                    <input class="field" id="ntTitle" maxlength="120" autocomplete="off" value="Thông báo từ admin"></div>
+                <div class="form-group" style="margin-top:12px"><label for="ntContent">Nội dung</label>
+                    <textarea class="field field-text" id="ntContent" maxlength="5000" style="height:140px" placeholder="Nhập nội dung thông báo hiển thị cho người dùng…"></textarea>
+                    <div class="hint" id="ntLen" style="margin-top:0"></div></div>
+                <div class="check-grid">
+                    <label class="check-chip"><input type="checkbox" id="ntActive" checked> Bật thông báo (hiển thị cho người dùng)</label>
+                </div>
+                <div class="action-bar">
+                    <button class="btn-secondary" id="btnNtPreview" type="button">👁 Preview</button>
+                    <button class="btn-primary" id="btnNtSave" type="button">Lưu thông báo</button>
+                    <button class="btn-secondary" id="btnNtCancel" type="button" style="display:none">Hủy chỉnh sửa</button>
+                    <span class="msg" id="ntMsg"></span>
+                </div>
+                <p class="hint">Nội dung hiển thị dạng văn bản thuần (giữ nguyên xuống dòng), tối đa 5000 ký tự. Để trống Title sẽ dùng "Thông báo từ admin".</p>
+            </div>
+            <div class="table-card">
+                <div class="table-wrapper">
+                    <table class="tbl-sm">
+                        <thead><tr><th>Title</th><th>Nội dung</th><th>Trạng thái</th><th>Cập nhật</th><th></th></tr></thead>
+                        <tbody id="ntBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
         <!-- ================= TAB (ADMIN): TÀI KHOẢN ================= -->
         <div class="tab-panel" id="tab-users">
             <div class="note-box" id="pwWarn" style="display:none">
@@ -2396,7 +2629,34 @@ HTML_TEMPLATE = """
             <button class="btn-primary" id="btnEuSave" style="margin-top:14px; width:100%; justify-content:center;">Lưu thay đổi</button>
         </div>
     </div>
+
+    <!-- Edit keyword Modal -->
+    <div id="kwModal" class="modal">
+        <div class="modal-content">
+            <span class="close-btn" id="kwModalClose">&times;</span>
+            <h3>✎ Sửa keyword</h3>
+            <div class="hint" style="margin:-10px 0 14px">Nhà cung cấp: <b id="kwEditProv"></b></div>
+            <div class="form-group"><label for="kwEditInput">Keyword</label>
+                <input class="field field-mono" id="kwEditInput" maxlength="63" autocomplete="off"></div>
+            <div class="form-group" style="margin-top:14px"><label for="kwEditStatus">Trạng thái</label>
+                <select class="field" id="kwEditStatus"><option value="active">Đang cấm</option><option value="disabled">Tạm tắt</option></select></div>
+            <div class="msg err" id="kwEditMsg"></div>
+            <button class="btn-primary" id="btnKwEditSave" type="button" style="margin-top:14px; width:100%; justify-content:center;">Lưu thay đổi</button>
+        </div>
+    </div>
+    <div class="toast-box" id="toastBox" aria-live="polite"></div>
 {% endif %}
+
+    <!-- Popup thông báo từ admin (nội dung lấy từ /api/notifications/active, không hard-code) -->
+    <div id="noticeOverlay" class="notice-overlay" aria-hidden="true">
+        <div class="notice-dialog" role="dialog" aria-modal="true" aria-labelledby="noticeTitle" aria-describedby="noticeBody">
+            <div class="notice-icon" aria-hidden="true">📢</div>
+            <h3 class="notice-title" id="noticeTitle"></h3>
+            <div class="notice-body" id="noticeBody"></div>
+            <div class="notice-count" id="noticeCount"></div>
+            <button type="button" class="btn-primary notice-close" id="noticeClose">Đóng</button>
+        </div>
+    </div>
     <script>
         const CSRF_TOKEN = "{{ csrf_token }}";
         const modal = document.getElementById("settingsModal");
@@ -2668,6 +2928,10 @@ HTML_TEMPLATE = """
             if (!IS_ADMIN) return;
             if (name === 'rules' && !loaded.rules) loadRules();
             if (name === 'blocks' && !loaded.blocks) loadBlocks();
+{% if is_admin %}
+            if (name === 'keywords' && !loaded.keywords) loadKeywordsTab();
+            if (name === 'notices' && !loaded.notices) loadNotices();
+{% endif %}
             if (name === 'users' && !loaded.users) loadUsers();
         }
 
@@ -2799,8 +3063,8 @@ HTML_TEMPLATE = """
         }
 
         // ---- ADMIN: helper gọi API ----
-        async function adminApi(url, body) {
-            const opt = { method: body === undefined ? 'GET' : 'POST', headers: { 'X-CSRF-Token': CSRF_TOKEN } };
+        async function adminApi(url, body, method) {
+            const opt = { method: method || (body === undefined ? 'GET' : 'POST'), headers: { 'X-CSRF-Token': CSRF_TOKEN } };
             if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
             const r = await fetch(url, opt);
             if (r.status === 401) { window.location.href = '/login'; throw new Error('Phiên đã hết hạn'); }
@@ -2993,6 +3257,361 @@ HTML_TEMPLATE = """
             });
         }
     </script>
+
+    <script>
+        // ================= POPUP THÔNG BÁO TỪ ADMIN =================
+        // Nội dung lấy từ /api/notifications/active (không hard-code). Mở lại = reset đếm ngược về 5s.
+        (function () {
+            const overlay = document.getElementById('noticeOverlay');
+            if (!overlay) return;
+            const titleEl = document.getElementById('noticeTitle'), bodyEl = document.getElementById('noticeBody');
+            const countEl = document.getElementById('noticeCount'), closeBtn = document.getElementById('noticeClose');
+            const TOTAL_MS = 5000, DEFAULT_TITLE = 'Thông báo từ admin';
+            let timer = null, deadline = 0, leftMs = 0, isOpen = false, lastFocus = null;
+
+            function stopTimer() { if (timer !== null) { clearInterval(timer); timer = null; } }
+            function secondsLeft() { return Math.max(0, Math.ceil((deadline - Date.now()) / 1000)); }
+            function render() { countEl.textContent = 'Tự động đóng sau ' + secondsLeft() + 's'; }
+            function startTimer() {
+                stopTimer();
+                deadline = Date.now() + leftMs;
+                render();
+                timer = setInterval(function () {
+                    if (Date.now() >= deadline) { closePopup(); return; }
+                    render();
+                }, 200);
+            }
+            function closePopup() {
+                stopTimer();
+                if (!isOpen) return;
+                isOpen = false;
+                overlay.classList.remove('show');
+                overlay.setAttribute('aria-hidden', 'true');
+                if (lastFocus && document.contains(lastFocus) && lastFocus.focus) { try { lastFocus.focus({ preventScroll: true }); } catch (e) { /* ignore */ } }
+                lastFocus = null;
+            }
+            function showPopup(title, content) {
+                stopTimer();                                   // mở lại khi đang mở → không để timer cũ chạy chồng
+                if (!isOpen) lastFocus = document.activeElement;
+                titleEl.textContent = title || DEFAULT_TITLE;
+                bodyEl.textContent = content || '';           // textContent: nội dung admin không bao giờ được chạy như HTML
+                bodyEl.scrollTop = 0;
+                isOpen = true;
+                overlay.classList.add('show');
+                overlay.setAttribute('aria-hidden', 'false');
+                leftMs = TOTAL_MS;                             // reset đếm ngược mỗi lần mở
+                if (document.hidden) { countEl.textContent = 'Tự động đóng sau ' + (TOTAL_MS / 1000) + 's'; } else { startTimer(); }
+                try { closeBtn.focus({ preventScroll: true }); } catch (e) { /* ignore */ }
+            }
+
+            closeBtn.addEventListener('click', closePopup);
+            overlay.addEventListener('click', function (e) { if (e.target === overlay) closePopup(); });
+            document.addEventListener('keydown', function (e) {
+                if (!isOpen) return;
+                if (e.key === 'Escape') { closePopup(); }
+                else if (e.key === 'Tab') { e.preventDefault(); closeBtn.focus(); }   // giữ focus trong popup
+            });
+            // Tab bị ẩn → tạm dừng đếm ngược để user kịp đọc khi quay lại
+            document.addEventListener('visibilitychange', function () {
+                if (!isOpen) return;
+                if (document.hidden) { leftMs = Math.max(0, deadline - Date.now()); stopTimer(); } else { startTimer(); }
+            });
+            window.addEventListener('pagehide', stopTimer);
+            window.showNoticePopup = showPopup;                // dùng lại cho nút Preview của admin
+
+            fetch('/api/notifications/active', { credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (j) { if (j && j.success && j.data && j.data.content) showPopup(j.data.title, j.data.content); })
+                .catch(function () { /* lỗi mạng/API: không hiện popup, không ảnh hưởng trang */ });
+        })();
+    </script>
+{% if is_admin %}
+    <script>
+        // ================= ADMIN: CẤM KEYWORD THEO NHÀ CUNG CẤP + QUẢN LÝ THÔNG BÁO =================
+        function toast(text, ok) {
+            const box = el('toastBox');
+            if (!box) return;
+            const t = document.createElement('div');
+            t.className = 'toast ' + (ok ? 'ok' : 'err');
+            t.textContent = text;
+            box.appendChild(t);
+            setTimeout(function () { t.remove(); }, ok ? 3000 : 5000);
+        }
+
+        // ---- Cấm keyword ----
+        let kwProvider = REGISTRARS[0], kwProvList = [], kwItems = [], kwReq = 0, kwEditId = null, kwAdding = false;
+        const kwModal = el('kwModal');
+        const kwUrl = p => '/api/admin/providers/' + encodeURIComponent(p) + '/banned-keywords';
+
+        function renderKwProviders() {
+            const byName = {};
+            kwProvList.forEach(p => { byName[p.name] = p; });
+            el('kwProviders').innerHTML = REGISTRARS.map(name => {
+                const p = byName[name] || { total: 0, active: 0 };
+                return '<button type="button" class="kw-prov' + (name === kwProvider ? ' active' : '') + '" data-p="' + esc(name) + '">' +
+                    esc(name) + ' <span class="kw-count" title="đang cấm / tổng số keyword">' + p.active + '/' + p.total + '</span></button>';
+            }).join('');
+        }
+        async function loadKwProviders() {
+            try { kwProvList = (await adminApi('/api/admin/providers')).data || []; }
+            catch (e) { toast(e.message, false); }
+            renderKwProviders();
+        }
+        async function loadKeywords() {
+            const req = ++kwReq, body = el('kwBody');
+            try {
+                const q = el('kwSearch').value.trim();
+                const d = (await adminApi(kwUrl(kwProvider) + (q ? '?q=' + encodeURIComponent(q) : ''))).data;
+                if (req !== kwReq) return;                      // đã đổi nhà cung cấp / từ khóa tìm → bỏ kết quả cũ
+                kwItems = d.items;
+                el('kwCount').textContent = d.total + ' keyword tại ' + kwProvider +
+                    (d.total > d.items.length ? ' (hiển thị ' + d.items.length + ' mới nhất — dùng ô tìm kiếm để lọc)' : '');
+                body.innerHTML = d.items.length ? d.items.map(it => {
+                    const on = it.status === 'active';
+                    return '<tr><td class="domain-cell">' + esc(it.keyword) + '</td><td>' +
+                        (on ? '<span class="badge badge-danger">ĐANG CẤM</span>' : '<span class="badge badge-muted">TẠM TẮT</span>') +
+                        '</td><td>' + esc(it.created_by || '—') + '</td><td class="date-cell">' + esc(fmtTime(it.updated_at)) +
+                        '</td><td><div class="row-actions">' +
+                        '<button class="btn-secondary btn-sm" data-kact="toggle" data-id="' + esc(it.id) + '">' + (on ? 'Tạm tắt' : 'Bật lại') + '</button>' +
+                        '<button class="btn-secondary btn-sm" data-kact="edit" data-id="' + esc(it.id) + '">✎ Sửa</button>' +
+                        '<button class="btn-danger btn-sm" data-kact="del" data-id="' + esc(it.id) + '">Xóa</button></div></td></tr>';
+                }).join('') : '<tr><td colspan="5" class="skipped">' +
+                    (q ? 'Không có keyword nào khớp' : 'Chưa có keyword cấm nào cho ' + esc(kwProvider)) + '</td></tr>';
+            } catch (e) {
+                if (req !== kwReq) return;
+                kwItems = [];
+                el('kwCount').textContent = '';
+                body.innerHTML = '<tr><td colspan="5" class="error-cell">' + esc(e.message) + '</td></tr>';
+            }
+        }
+        function reloadKeywords() { return Promise.all([loadKwProviders(), loadKeywords()]); }
+        async function loadKeywordsTab() {
+            loaded.keywords = true;
+            await reloadKeywords();
+        }
+        function selectKwProvider(name) {
+            if (!REGISTRARS.includes(name) || name === kwProvider) return;
+            kwProvider = name;
+            el('kwProviderSel').value = name;
+            el('kwSearch').value = '';
+            setMsg('kwMsg', '');
+            renderKwProviders();
+            loadKeywords();
+        }
+        async function addKeyword(ev) {
+            ev.preventDefault();
+            if (kwAdding) return;
+            const kw = el('kwInput').value.trim();
+            if (!kw) { setMsg('kwMsg', 'Keyword không được để trống', false); el('kwInput').focus(); return; }
+            kwAdding = true; el('btnKwAdd').disabled = true;
+            try {
+                const prov = kwProvider;
+                await adminApi(kwUrl(prov), { keyword: kw, status: el('kwStatusSel').value });
+                setMsg('kwMsg', 'Đã thêm keyword "' + kw + '" cho ' + prov, true);
+                toast('Đã thêm keyword cho ' + prov, true);
+                el('kwInput').value = '';
+                await reloadKeywords();
+            } catch (e) {
+                setMsg('kwMsg', e.message, false);
+                toast(e.message, false);
+            } finally {
+                kwAdding = false; el('btnKwAdd').disabled = false; el('kwInput').focus();
+            }
+        }
+        function openKwModal(id) {
+            const it = kwItems.find(x => x.id === id);
+            if (!it) return;
+            kwEditId = id;
+            el('kwEditProv').textContent = kwProvider;
+            el('kwEditInput').value = it.keyword;
+            el('kwEditStatus').value = it.status;
+            setMsg('kwEditMsg', '');
+            kwModal.classList.add('show');
+            el('kwEditInput').focus();
+        }
+        function closeKwModal() { kwModal.classList.remove('show'); kwEditId = null; }
+        async function saveKwEdit() {
+            if (!kwEditId) return;
+            const kw = el('kwEditInput').value.trim();
+            if (!kw) { setMsg('kwEditMsg', 'Keyword không được để trống', false); return; }
+            const btn = el('btnKwEditSave');
+            btn.disabled = true;
+            try {
+                await adminApi(kwUrl(kwProvider) + '/' + encodeURIComponent(kwEditId), { keyword: kw, status: el('kwEditStatus').value }, 'PUT');
+                closeKwModal();
+                toast('Đã cập nhật keyword', true);
+                await reloadKeywords();
+            } catch (e) {
+                setMsg('kwEditMsg', e.message, false);
+            } finally { btn.disabled = false; }
+        }
+        async function toggleKeyword(id) {
+            const it = kwItems.find(x => x.id === id);
+            if (!it) return;
+            const next = it.status === 'active' ? 'disabled' : 'active';
+            try {
+                await adminApi(kwUrl(kwProvider) + '/' + encodeURIComponent(id), { status: next }, 'PUT');
+                toast(next === 'active' ? 'Đã bật lại keyword' : 'Đã tạm tắt keyword', true);
+                await reloadKeywords();
+            } catch (e) { toast(e.message, false); }
+        }
+        async function deleteKeyword(id) {
+            const it = kwItems.find(x => x.id === id);
+            if (!it || !confirm('Xóa keyword "' + it.keyword + '" khỏi ' + kwProvider + '?')) return;
+            try {
+                await adminApi(kwUrl(kwProvider) + '/' + encodeURIComponent(id), undefined, 'DELETE');
+                toast('Đã xóa keyword', true);
+                await reloadKeywords();
+            } catch (e) { toast(e.message, false); }
+        }
+
+        // ---- Thông báo popup ----
+        const NT_DEFAULT_TITLE = 'Thông báo từ admin';
+        let ntItems = [], ntEditId = null, ntBusy = false;
+
+        function updateNtLen() { el('ntLen').textContent = el('ntContent').value.length + ' / 5000 ký tự'; }
+        function ntResetForm() {
+            ntEditId = null;
+            el('ntTitle').value = NT_DEFAULT_TITLE;
+            el('ntContent').value = '';
+            el('ntActive').checked = true;
+            el('ntFormTitle').textContent = 'Tạo thông báo mới';
+            el('btnNtSave').textContent = 'Lưu thông báo';
+            el('btnNtCancel').style.display = 'none';
+            updateNtLen();
+        }
+        function ntShort(s, n) {
+            s = String(s || '').split(NL).join(' ');
+            return s.length > n ? s.slice(0, n) + '…' : s;
+        }
+        function renderNotices() {
+            const active = ntItems.find(x => x.is_active);
+            el('ntCurrent').innerHTML = active
+                ? '<div class="nt-current"><div><b>' + esc(active.title) + '</b> <span class="badge badge-success">ĐANG BẬT</span>' +
+                  '<div class="nt-content" style="margin-top:6px;max-width:none;white-space:pre-wrap">' + esc(active.content) + '</div></div></div>'
+                : '<div class="skipped">Hiện chưa có thông báo nào đang bật — người dùng sẽ không thấy popup.</div>';
+            el('ntBody').innerHTML = ntItems.length ? ntItems.map(it =>
+                '<tr><td><b>' + esc(it.title) + '</b></td><td class="nt-content">' + esc(ntShort(it.content, 140)) + '</td><td>' +
+                (it.is_active ? '<span class="badge badge-success">ĐANG BẬT</span>' : '<span class="badge badge-muted">TẮT</span>') +
+                '</td><td class="date-cell">' + esc(fmtTime(it.updated_at)) + '</td><td><div class="row-actions">' +
+                '<button class="btn-secondary btn-sm" data-nact="toggle" data-id="' + esc(it.id) + '">' + (it.is_active ? 'Tắt' : 'Bật') + '</button>' +
+                '<button class="btn-secondary btn-sm" data-nact="edit" data-id="' + esc(it.id) + '">✎ Sửa</button>' +
+                '<button class="btn-danger btn-sm" data-nact="del" data-id="' + esc(it.id) + '">Xóa</button></div></td></tr>').join('')
+                : '<tr><td colspan="5" class="skipped">Chưa có thông báo nào</td></tr>';
+        }
+        async function loadNotices() {
+            try {
+                ntItems = (await adminApi('/api/admin/notifications')).data || [];
+                loaded.notices = true;
+                renderNotices();
+            } catch (e) {
+                toast(e.message, false);
+                el('ntCurrent').innerHTML = '<div class="error-cell">' + esc(e.message) + '</div>';
+                el('ntBody').innerHTML = '<tr><td colspan="5" class="error-cell">' + esc(e.message) + '</td></tr>';
+            }
+        }
+        async function saveNotice() {
+            if (ntBusy) return;
+            const content = el('ntContent').value.trim();
+            if (!content) { setMsg('ntMsg', 'Nội dung thông báo không được để trống', false); el('ntContent').focus(); return; }
+            const body = { title: el('ntTitle').value.trim() || NT_DEFAULT_TITLE, content: content, is_active: el('ntActive').checked };
+            const editing = ntEditId;
+            ntBusy = true; el('btnNtSave').disabled = true;
+            try {
+                if (editing) await adminApi('/api/admin/notifications/' + encodeURIComponent(editing), body, 'PUT');
+                else await adminApi('/api/admin/notifications', body);
+                toast(editing ? 'Đã cập nhật thông báo' : 'Đã lưu thông báo', true);
+                setMsg('ntMsg', '');
+                ntResetForm();
+                await loadNotices();
+            } catch (e) {
+                setMsg('ntMsg', e.message, false);
+                toast(e.message, false);
+            } finally { ntBusy = false; el('btnNtSave').disabled = false; }
+        }
+        function editNotice(id) {
+            const it = ntItems.find(x => x.id === id);
+            if (!it) return;
+            ntEditId = id;
+            el('ntTitle').value = it.title;
+            el('ntContent').value = it.content;
+            el('ntActive').checked = it.is_active;
+            el('ntFormTitle').textContent = 'Chỉnh sửa thông báo';
+            el('btnNtSave').textContent = 'Lưu thay đổi';
+            el('btnNtCancel').style.display = '';
+            setMsg('ntMsg', '');
+            updateNtLen();
+            el('ntFormTitle').scrollIntoView({ behavior: 'smooth', block: 'center' });
+            el('ntContent').focus();
+        }
+        async function toggleNotice(id) {
+            const it = ntItems.find(x => x.id === id);
+            if (!it) return;
+            try {
+                await adminApi('/api/admin/notifications/' + encodeURIComponent(id) + '/status', { is_active: !it.is_active }, 'PATCH');
+                toast(it.is_active ? 'Đã tắt thông báo' : 'Đã bật thông báo (các thông báo khác được tắt)', true);
+                await loadNotices();
+            } catch (e) { toast(e.message, false); }
+        }
+        async function deleteNotice(id) {
+            const it = ntItems.find(x => x.id === id);
+            if (!it || !confirm('Xóa thông báo "' + it.title + '"? Người dùng sẽ không còn nhận thông báo này.')) return;
+            try {
+                await adminApi('/api/admin/notifications/' + encodeURIComponent(id), undefined, 'DELETE');
+                if (ntEditId === id) ntResetForm();
+                toast('Đã xóa thông báo', true);
+                await loadNotices();
+            } catch (e) { toast(e.message, false); }
+        }
+        function previewNotice() {
+            const content = el('ntContent').value.trim();
+            if (!content) { toast('Hãy nhập nội dung để xem trước', false); return; }
+            if (typeof window.showNoticePopup !== 'function') { toast('Không mở được popup xem trước', false); return; }
+            window.showNoticePopup(el('ntTitle').value.trim() || NT_DEFAULT_TITLE, content);
+        }
+
+        // ---- khởi tạo ----
+        (function () {
+            el('kwProviderSel').innerHTML = REGISTRARS.map(r => '<option value="' + esc(r) + '">' + esc(r) + '</option>').join('');
+            el('kwProviderSel').value = kwProvider;
+            renderKwProviders();
+            el('kwProviders').addEventListener('click', e => {
+                const b = e.target.closest('button[data-p]');
+                if (b) selectKwProvider(b.dataset.p);
+            });
+            el('kwProviderSel').addEventListener('change', e => selectKwProvider(e.target.value));
+            el('kwForm').addEventListener('submit', addKeyword);
+            el('btnKwReload').addEventListener('click', reloadKeywords);
+            let kwTimer = null;
+            el('kwSearch').addEventListener('input', () => { clearTimeout(kwTimer); kwTimer = setTimeout(loadKeywords, 300); });
+            el('kwBody').addEventListener('click', e => {
+                const b = e.target.closest('button[data-kact]');
+                if (!b) return;
+                if (b.dataset.kact === 'toggle') toggleKeyword(b.dataset.id);
+                else if (b.dataset.kact === 'edit') openKwModal(b.dataset.id);
+                else if (b.dataset.kact === 'del') deleteKeyword(b.dataset.id);
+            });
+            el('kwModalClose').addEventListener('click', closeKwModal);
+            kwModal.addEventListener('click', e => { if (e.target === kwModal) closeKwModal(); });
+            el('btnKwEditSave').addEventListener('click', saveKwEdit);
+            el('kwEditInput').addEventListener('keydown', e => { if (e.key === 'Enter') saveKwEdit(); });
+            document.addEventListener('keydown', e => { if (e.key === 'Escape' && kwModal.classList.contains('show')) closeKwModal(); });
+
+            el('ntContent').addEventListener('input', updateNtLen);
+            el('btnNtSave').addEventListener('click', saveNotice);
+            el('btnNtPreview').addEventListener('click', previewNotice);
+            el('btnNtCancel').addEventListener('click', () => { ntResetForm(); setMsg('ntMsg', ''); });
+            el('ntBody').addEventListener('click', e => {
+                const b = e.target.closest('button[data-nact]');
+                if (!b) return;
+                if (b.dataset.nact === 'toggle') toggleNotice(b.dataset.id);
+                else if (b.dataset.nact === 'edit') editNotice(b.dataset.id);
+                else if (b.dataset.nact === 'del') deleteNotice(b.dataset.id);
+            });
+            updateNtLen();
+        })();
+    </script>
+{% endif %}
 </body>
 </html>
 """
@@ -3475,6 +4094,390 @@ def api_admin_blocks_remove():
         db.domain_blocks.delete_one({"domain": domain})
     _invalidate_config()
     return jsonify(ok=True)
+
+
+# ---------------- helper chung cho 2 tính năng admin mới ----------------
+_PROVIDER_BY_LOWER = {r.lower(): r for r in REGISTRARS}
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _fail(msg, status):
+    return jsonify(success=False, error=msg), status
+
+
+def _json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
+
+
+def _oid(value):
+    """Chuỗi 24 ký tự hex → ObjectId, ngược lại None (ID không hợp lệ)."""
+    if ObjectId is None or not isinstance(value, str) or len(value) != 24 or not ObjectId.is_valid(value):
+        return None
+    return ObjectId(value)
+
+
+def _resolve_provider(name):
+    return _PROVIDER_BY_LOWER.get(str(name or "").strip().lower())
+
+
+def db_errors(view):
+    """Lỗi MongoDB trong 1 request → JSON 500 thân thiện thay vì làm sập trang."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        try:
+            return view(*args, **kwargs)
+        except PyMongoError:
+            log.exception("Lỗi MongoDB ở %s", request.path)
+            return _fail("Lỗi cơ sở dữ liệu, vui lòng thử lại", 500)
+    return wrapper
+
+
+# ---------------- ADMIN: keyword cấm theo nhà cung cấp ----------------
+def _kw_item(doc):
+    return {
+        "id": str(doc["_id"]), "provider": doc.get("provider"), "keyword": doc.get("keyword", ""),
+        "status": doc.get("status", KW_ACTIVE), "created_by": doc.get("created_by"),
+        "created_at": _iso(doc.get("created_at")), "updated_at": _iso(doc.get("updated_at")),
+    }
+
+
+def _kw_status(value, default=KW_ACTIVE):
+    if value is None:
+        return default
+    return value if value in (KW_ACTIVE, KW_DISABLED) else None
+
+
+@app.route("/api/admin/providers", methods=["GET"])
+@admin_guard
+@db_errors
+def api_admin_providers():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    counts = {}
+    for row in db.provider_banned_keywords.aggregate(
+            [{"$group": {"_id": {"p": "$provider", "s": "$status"}, "n": {"$sum": 1}}}]):
+        c = counts.setdefault(row["_id"].get("p"), {"total": 0, "active": 0})
+        c["total"] += row["n"]
+        if row["_id"].get("s") == KW_ACTIVE:
+            c["active"] += row["n"]
+    return jsonify(success=True, data=[
+        {"id": r, "name": r, "total": counts.get(r, {}).get("total", 0), "active": counts.get(r, {}).get("active", 0)}
+        for r in REGISTRARS])
+
+
+@app.route("/api/admin/providers/<provider>/banned-keywords", methods=["GET"])
+@admin_guard
+@db_errors
+def api_admin_kw_list(provider):
+    prov = _resolve_provider(provider)
+    if not prov:
+        return _fail("Nhà cung cấp không tồn tại", 404)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    flt = {"provider": prov}
+    q = request.args.get("q", "").strip().lower()[:100]
+    if q:
+        flt["normalized_keyword"] = {"$regex": re.escape(q)}
+    status = request.args.get("status", "").strip()
+    if status:
+        if status not in (KW_ACTIVE, KW_DISABLED):
+            return _fail("Trạng thái không hợp lệ", 400)
+        flt["status"] = status
+    total = db.provider_banned_keywords.count_documents(flt)
+    items = [_kw_item(d) for d in db.provider_banned_keywords.find(flt).sort("created_at", -1).limit(1000)]
+    return jsonify(success=True, data={"provider": prov, "total": total, "items": items})
+
+
+@app.route("/api/admin/providers/<provider>/banned-keywords", methods=["POST"])
+@admin_guard
+@db_errors
+def api_admin_kw_create(provider):
+    prov = _resolve_provider(provider)
+    if not prov:
+        return _fail("Nhà cung cấp không tồn tại", 404)
+    data = _json_body()
+    if data is None:
+        return _fail("Dữ liệu gửi lên không hợp lệ", 400)
+    kw, norm, err = clean_banned_keyword(data.get("keyword"))
+    if err:
+        return _fail(err, 400)
+    status = _kw_status(data.get("status"))
+    if status is None:
+        return _fail("Trạng thái không hợp lệ", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    col = db.provider_banned_keywords
+    if col.find_one({"provider": prov, "normalized_keyword": norm}, {"_id": 1}):
+        return _fail(f'Keyword "{kw}" đã tồn tại ở {prov}', 409)
+    if col.count_documents({"provider": prov}) >= KW_MAX_PER_PROVIDER:
+        return _fail(f"Mỗi nhà cung cấp tối đa {KW_MAX_PER_PROVIDER} keyword", 400)
+    now = _now()
+    doc = {"provider": prov, "keyword": kw, "normalized_keyword": norm, "status": status,
+           "created_at": now, "updated_at": now, "created_by": session["user"]}
+    try:
+        doc["_id"] = col.insert_one(doc).inserted_id
+    except DuplicateKeyError:
+        return _fail(f'Keyword "{kw}" đã tồn tại ở {prov}', 409)
+    _invalidate_config()
+    log.info("Admin %s thêm keyword cấm %r cho %s", session["user"], norm, prov)
+    return jsonify(success=True, data=_kw_item(doc)), 201
+
+
+@app.route("/api/admin/providers/<provider>/banned-keywords/<kid>", methods=["PUT"])
+@admin_guard
+@db_errors
+def api_admin_kw_update(provider, kid):
+    prov = _resolve_provider(provider)
+    if not prov:
+        return _fail("Nhà cung cấp không tồn tại", 404)
+    oid = _oid(kid)
+    if oid is None:
+        return _fail("ID không hợp lệ", 400)
+    data = _json_body()
+    if data is None:
+        return _fail("Dữ liệu gửi lên không hợp lệ", 400)
+    upd = {}
+    if "keyword" in data:
+        kw, norm, err = clean_banned_keyword(data.get("keyword"))
+        if err:
+            return _fail(err, 400)
+        upd.update(keyword=kw, normalized_keyword=norm)
+    if "status" in data:
+        status = _kw_status(data.get("status"), default=None)
+        if status is None:
+            return _fail("Trạng thái không hợp lệ", 400)
+        upd["status"] = status
+    if not upd:
+        return _fail("Không có thay đổi nào", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    col = db.provider_banned_keywords
+    cur = col.find_one({"_id": oid, "provider": prov})
+    if not cur:
+        return _fail("Không tìm thấy keyword", 404)
+    if "normalized_keyword" in upd and col.find_one(
+            {"provider": prov, "normalized_keyword": upd["normalized_keyword"], "_id": {"$ne": oid}}, {"_id": 1}):
+        return _fail(f'Keyword "{upd["keyword"]}" đã tồn tại ở {prov}', 409)
+    upd.update(updated_at=_now(), updated_by=session["user"])
+    try:
+        col.update_one({"_id": oid, "provider": prov}, {"$set": upd})
+    except DuplicateKeyError:
+        return _fail("Keyword đã tồn tại ở nhà cung cấp này", 409)
+    _invalidate_config()
+    log.info("Admin %s sửa keyword cấm %s của %s", session["user"], kid, prov)
+    return jsonify(success=True, data=_kw_item({**cur, **upd}))
+
+
+@app.route("/api/admin/providers/<provider>/banned-keywords/<kid>", methods=["DELETE"])
+@admin_guard
+@db_errors
+def api_admin_kw_delete(provider, kid):
+    prov = _resolve_provider(provider)
+    if not prov:
+        return _fail("Nhà cung cấp không tồn tại", 404)
+    oid = _oid(kid)
+    if oid is None:
+        return _fail("ID không hợp lệ", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    if not db.provider_banned_keywords.delete_one({"_id": oid, "provider": prov}).deleted_count:
+        return _fail("Không tìm thấy keyword", 404)
+    _invalidate_config()
+    log.info("Admin %s xóa keyword cấm %s của %s", session["user"], kid, prov)
+    return jsonify(success=True, data=None)
+
+
+# ---------------- ADMIN: thông báo popup ----------------
+def _notice_item(doc):
+    return {
+        "id": str(doc["_id"]), "title": doc.get("title") or NOTICE_DEFAULT_TITLE, "content": doc.get("content", ""),
+        "is_active": bool(doc.get("is_active")), "created_by": doc.get("created_by"),
+        "created_at": _iso(doc.get("created_at")), "updated_at": _iso(doc.get("updated_at")),
+    }
+
+
+def _clean_notice_text(value, limit):
+    value = _CTRL_RE.sub("", value.replace("\r\n", "\n").replace("\r", "\n"))
+    return value.strip() if len(value.strip()) <= limit else None
+
+
+def _clean_notice_fields(data, need_content=True):
+    """→ ({title?, content?}, lỗi). Title để trống = tiêu đề mặc định; content bắt buộc khi tạo."""
+    out = {}
+    if "title" in data or need_content:
+        raw = data.get("title")
+        if raw is not None and not isinstance(raw, str):
+            return None, "Tiêu đề không hợp lệ"
+        title = _clean_notice_text(raw or "", NOTICE_TITLE_MAX)
+        if title is None:
+            return None, f"Tiêu đề tối đa {NOTICE_TITLE_MAX} ký tự"
+        out["title"] = title.replace("\n", " ") or NOTICE_DEFAULT_TITLE
+    if "content" in data or need_content:
+        raw = data.get("content")
+        if not isinstance(raw, str):
+            return None, "Nội dung không hợp lệ"
+        content = _clean_notice_text(raw, NOTICE_CONTENT_MAX)
+        if content is None:
+            return None, f"Nội dung tối đa {NOTICE_CONTENT_MAX} ký tự"
+        if not content:
+            return None, "Nội dung thông báo không được để trống"
+        out["content"] = content
+    return out, None
+
+
+def _set_notice_active(db, oid, active, user):
+    """Bật/tắt 1 thông báo. Khi bật: tắt mọi thông báo khác (chỉ 1 thông báo active; index unique
+    từng phần chặn race giữa 2 request đồng thời → thử lại vài lần)."""
+    col = db.admin_notifications
+    now = _now()
+    if not active:
+        col.update_one({"_id": oid}, {"$set": {"is_active": False, "updated_at": now, "updated_by": user}})
+        return True
+    for _ in range(3):
+        col.update_many({"_id": {"$ne": oid}, "is_active": True}, {"$set": {"is_active": False, "updated_at": now}})
+        try:
+            col.update_one({"_id": oid}, {"$set": {"is_active": True, "updated_at": now, "updated_by": user}})
+            return True
+        except DuplicateKeyError:
+            continue
+    return False
+
+
+@app.route("/api/admin/notifications", methods=["GET"])
+@admin_guard
+@db_errors
+def api_admin_notices():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    items = [_notice_item(d) for d in db.admin_notifications.find({}).sort("created_at", -1).limit(200)]
+    return jsonify(success=True, data=items)
+
+
+@app.route("/api/admin/notifications", methods=["POST"])
+@admin_guard
+@db_errors
+def api_admin_notice_create():
+    data = _json_body()
+    if data is None:
+        return _fail("Dữ liệu gửi lên không hợp lệ", 400)
+    fields, err = _clean_notice_fields(data)
+    if err:
+        return _fail(err, 400)
+    active = data.get("is_active", False)
+    if not isinstance(active, bool):
+        return _fail("Trạng thái không hợp lệ", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    now = _now()
+    doc = {**fields, "is_active": False, "created_by": session["user"], "created_at": now, "updated_at": now}
+    doc["_id"] = db.admin_notifications.insert_one(doc).inserted_id
+    if active:
+        if not _set_notice_active(db, doc["_id"], True, session["user"]):
+            return _fail("Không bật được thông báo (đang có thao tác khác) — hãy thử lại", 409)
+        doc["is_active"] = True
+    log.info("Admin %s tạo thông báo %s (active=%s)", session["user"], doc["_id"], active)
+    return jsonify(success=True, data=_notice_item(doc)), 201
+
+
+@app.route("/api/admin/notifications/<nid>", methods=["PUT"])
+@admin_guard
+@db_errors
+def api_admin_notice_update(nid):
+    oid = _oid(nid)
+    if oid is None:
+        return _fail("ID không hợp lệ", 400)
+    data = _json_body()
+    if data is None:
+        return _fail("Dữ liệu gửi lên không hợp lệ", 400)
+    fields, err = _clean_notice_fields(data, need_content=False)
+    if err:
+        return _fail(err, 400)
+    active = data.get("is_active")
+    if active is not None and not isinstance(active, bool):
+        return _fail("Trạng thái không hợp lệ", 400)
+    if not fields and active is None:
+        return _fail("Không có thay đổi nào", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    col = db.admin_notifications
+    if not col.find_one({"_id": oid}, {"_id": 1}):
+        return _fail("Không tìm thấy thông báo", 404)
+    if fields:
+        col.update_one({"_id": oid}, {"$set": {**fields, "updated_at": _now(), "updated_by": session["user"]}})
+    if active is not None and not _set_notice_active(db, oid, active, session["user"]):
+        return _fail("Không bật được thông báo (đang có thao tác khác) — hãy thử lại", 409)
+    doc = col.find_one({"_id": oid})
+    if not doc:
+        return _fail("Không tìm thấy thông báo", 404)
+    log.info("Admin %s sửa thông báo %s", session["user"], nid)
+    return jsonify(success=True, data=_notice_item(doc))
+
+
+@app.route("/api/admin/notifications/<nid>/status", methods=["PATCH"])
+@admin_guard
+@db_errors
+def api_admin_notice_status(nid):
+    oid = _oid(nid)
+    if oid is None:
+        return _fail("ID không hợp lệ", 400)
+    data = _json_body()
+    if data is None or not isinstance(data.get("is_active"), bool):
+        return _fail("Thiếu hoặc sai giá trị is_active (true/false)", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    if not db.admin_notifications.find_one({"_id": oid}, {"_id": 1}):
+        return _fail("Không tìm thấy thông báo", 404)
+    if not _set_notice_active(db, oid, data["is_active"], session["user"]):
+        return _fail("Không bật được thông báo (đang có thao tác khác) — hãy thử lại", 409)
+    doc = db.admin_notifications.find_one({"_id": oid})
+    if not doc:
+        return _fail("Không tìm thấy thông báo", 404)
+    log.info("Admin %s %s thông báo %s", session["user"], "bật" if data["is_active"] else "tắt", nid)
+    return jsonify(success=True, data=_notice_item(doc))
+
+
+@app.route("/api/admin/notifications/<nid>", methods=["DELETE"])
+@admin_guard
+@db_errors
+def api_admin_notice_delete(nid):
+    oid = _oid(nid)
+    if oid is None:
+        return _fail("ID không hợp lệ", 400)
+    db = get_db()
+    if db is None:
+        return _no_db()
+    if not db.admin_notifications.delete_one({"_id": oid}).deleted_count:
+        return _fail("Không tìm thấy thông báo", 404)
+    log.info("Admin %s xóa thông báo %s", session["user"], nid)
+    return jsonify(success=True, data=None)
+
+
+# ---------------- USER: thông báo đang bật (popup) ----------------
+@app.route("/api/notifications/active", methods=["GET"])
+@user_read_guard
+def api_notice_active():
+    """Chỉ trả title + content của thông báo đang bật (hoặc data=null). Không lộ trường quản trị."""
+    db = get_db()
+    if db is None:
+        return jsonify(success=False, data=None, error="Chưa kết nối được cơ sở dữ liệu"), 503
+    try:
+        doc = db.admin_notifications.find_one({"is_active": True}, sort=[("updated_at", -1)])
+    except PyMongoError:
+        log.exception("Lỗi đọc thông báo active")
+        return jsonify(success=False, data=None, error="Lỗi cơ sở dữ liệu"), 503
+    if not doc or not str(doc.get("content", "")).strip():
+        return jsonify(success=True, data=None)
+    return jsonify(success=True, data={"title": doc.get("title") or NOTICE_DEFAULT_TITLE, "content": doc["content"]})
 
 
 try:                       # kết nối MongoDB sớm (lỗi thì tự thử lại ở request sau)
