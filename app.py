@@ -523,6 +523,56 @@ def rules_summary():
     return out
 
 
+# ---------- cài đặt kiểm tra (admin bật/tắt cho TẤT CẢ user) ----------
+CHECK_OPTIONS = [
+    ("check_buy", "Khả năng mua (theo registrar)"),
+    ("check_registrar", "Nhà đăng ký (Registrar)"),
+    ("check_dates", "Ngày đăng ký"),
+    ("check_cf", "Cloudflare Banned"),
+    ("check_hold", "Trạng thái Domain (Hold / Lock)"),
+]
+CHECK_OPTION_KEYS = [k for k, _ in CHECK_OPTIONS]
+_opt_cache = {"ts": -1e9, "val": None}
+_opt_lock = threading.Lock()
+OPT_TTL = 10
+
+
+def _invalidate_check_options():
+    with _opt_lock:
+        _opt_cache["ts"] = -1e9
+
+
+def get_check_options(force=False):
+    """→ {check_xxx: bool}  True = admin cho phép user tick mục này. Mục nào admin không chọn → False.
+    Chưa cấu hình / MongoDB lỗi → dùng giá trị cache cũ hoặc mặc định (cho phép tất cả)."""
+    now = time.monotonic()
+    with _opt_lock:
+        if not force and _opt_cache["val"] is not None and now - _opt_cache["ts"] < OPT_TTL:
+            return dict(_opt_cache["val"])
+        val = {k: True for k in CHECK_OPTION_KEYS}
+        db = get_db()
+        if db is None:
+            if _opt_cache["val"] is not None:
+                val = dict(_opt_cache["val"])
+            _opt_cache["ts"] = now - OPT_TTL + 3
+            _opt_cache["val"] = val
+            return dict(val)
+        try:
+            doc = db.app_settings.find_one({"_id": "check_options"}) or {}
+            saved = doc.get("options") or {}
+            for k in CHECK_OPTION_KEYS:
+                if k in saved:
+                    val[k] = bool(saved[k])
+            _opt_cache.update(ts=now, val=val)
+        except PyMongoError as e:
+            log.error("Lỗi đọc cài đặt kiểm tra từ MongoDB: %s", e)
+            if _opt_cache["val"] is not None:
+                val = dict(_opt_cache["val"])
+            _opt_cache["ts"] = now - OPT_TTL + 3
+            _opt_cache["val"] = val
+        return dict(val)
+
+
 class RateLimiter:
     """Sliding window trong RAM (đủ dùng cho 1 worker)."""
 
@@ -774,10 +824,10 @@ def format_buyability_html(results, tld_ok, state, cf=None):
                 + "<div class='buy-reason'>⛔ Bị Registry Policy cấm đăng ký</div>")
     if state == "unknown":
         return (_badge("badge-warning", "CHƯA XÁC ĐỊNH")
-                + "<div class='buy-reason'>Không tra cứu được WHOIS/RDAP — bấm Retry lỗi</div>")
+                + "<div class='buy-reason'>Hãy thử kiểm tra lại domain này.</div>")
     if cf.get("failed"):
         return (_badge("badge-warning", "CHƯA XÁC ĐỊNH")
-                + "<div class='buy-reason'>Lỗi kiểm tra Cloudflare — bấm Retry lỗi</div>")
+                + "<div class='buy-reason'>Hãy thử kiểm tra lại domain này.</div>")
 
     banned = [(n, i["reason"] or "TLD bị cấm") for n, i in results.items() if not i["ok"]]
     ban_tags = " ".join(
@@ -1323,7 +1373,6 @@ def check_cf_eligibility(domain):
 TRANSFER_MIN_DAYS = _int_env("TRANSFER_MIN_DAYS", 60)
 
 _TRANSFER_BLOCKERS = {
-    "clientTransferProhibited": "Đang khóa Transfer tại registrar (clientTransferProhibited) — cần mở khóa",
     "serverTransferProhibited": "Registry chặn Transfer (serverTransferProhibited)",
     "pendingTransfer": "Domain đang trong quá trình transfer (pendingTransfer)",
     "redemptionPeriod": "Domain đang ở Redemption Period",
@@ -1331,6 +1380,9 @@ _TRANSFER_BLOCKERS = {
     "pendingRestore": "Domain đang Pending Restore",
     "serverHold": "Domain bị serverHold",
 }
+
+
+CLIENT_LOCK_NOTE = "clientTransferProhibited - liên hệ IT để mở khóa domain"
 
 
 def _parse_short_date(s):
@@ -1389,16 +1441,30 @@ def check_transfer_eligibility(domain):
         if since <= TRANSFER_MIN_DAYS:
             reasons.append(f"Vừa transfer {since} ngày trước — cần hơn {TRANSFER_MIN_DAYS} ngày kể từ lần transfer gần nhất")
     keys = set(info.get("status_keys") or [])
+    client_lock = "clientTransferProhibited" in keys          # khóa ở registrar → chỉ cần IT mở khóa
     for key, text in _TRANSFER_BLOCKERS.items():
         if key in keys:
             reasons.append(text)
 
     if reasons:
+        if client_lock:
+            reasons.append(CLIENT_LOCK_NOTE)
         return done("badge-danger", "CHƯA ĐỦ ĐIỀU KIỆN", reasons)
     if not created:
-        return done("badge-warning", "CHƯA XÁC ĐỊNH",
-                    ["Không lấy được ngày đăng ký nên chưa kiểm tra được mốc 60 ngày "
-                     "(không phát hiện khóa transfer)"])
+        notes = ["Không lấy được ngày đăng ký nên chưa kiểm tra được mốc 60 ngày "
+                 + ("(không phát hiện khóa transfer)" if not client_lock else "")]
+        if client_lock:
+            notes.append(CLIENT_LOCK_NOTE)
+        return done("badge-warning", "CHƯA XÁC ĐỊNH", notes)
+    if client_lock:
+        out["eligible"] = True
+        out["needs_unlock"] = True
+        out["reasons"] = [CLIENT_LOCK_NOTE]
+        out["result_html"] = (
+            _badge("badge-warning", "Có thể chuyển")
+            + f"<div class='buy-reason'>⚠ {html.escape(CLIENT_LOCK_NOTE)}</div>"
+            + f"<div class='buy-reason ok'>✓ Đã đăng ký {out['age_days']} ngày</div>")
+        return out
     out["eligible"] = True
     return done("badge-success", "ĐỦ ĐIỀU KIỆN",
                 ok_note=f"✓ Đã đăng ký {out['age_days']} ngày · không bị chặn transfer")
@@ -2174,10 +2240,11 @@ HTML_TEMPLATE = """
         <div class="tabs" id="tabsBar">
             <button class="tab-btn active" data-tab="buy">◈ Kiểm tra mua domain</button>
             <button class="tab-btn" data-tab="transfer">⇄ Kiểm tra Transfer</button>
-            <button class="tab-btn" data-tab="price">$ Kiểm tra giá GoDaddy</button>
+            <button class="tab-btn" data-tab="price">$ Kiểm tra giá mua mới Godaddy (tham khảo)</button>
             {% if is_admin %}
             <span class="tab-sep"></span>
             <button class="tab-btn" data-tab="rules">⚙ Đuôi cấm / cho phép</button>
+            <button class="tab-btn" data-tab="checkopts">☑ Cài đặt kiểm tra</button>
             <button class="tab-btn" data-tab="blocks">🚫 Domain cấm (ẩn)</button>
             <button class="tab-btn" data-tab="keywords">🔤 Cấm Keyword</button>
             <button class="tab-btn" data-tab="notices">📢 Thông báo</button>
@@ -2235,7 +2302,7 @@ HTML_TEMPLATE = """
                         </div>
                         <div class="legend-row" data-key="unknownBuy">
                             <span class="badge badge-warning">CHƯA XÁC ĐỊNH</span>
-                            <span>Tra cứu WHOIS/RDAP hoặc Cloudflare lỗi · cần Retry</span>
+                            <span>Chưa xác định được / lỗi Cloudflare · hãy thử kiểm tra lại domain này</span>
                         </div>
                         <div class="legend-row" data-key="daDK">
                             <span class="badge badge-muted">ĐÃ ĐĂNG KÝ</span>
@@ -2339,7 +2406,8 @@ HTML_TEMPLATE = """
                 <span class="note-icon">ℹ️</span>
                 <div>
                     <strong>Điều kiện đủ transfer:</strong> domain đã đăng ký <b>hơn 60 ngày</b> (và hơn 60 ngày kể từ lần transfer gần nhất nếu có)
-                    và <b>không bị chặn transfer</b> (clientTransferProhibited, serverTransferProhibited, pendingTransfer, Redemption / Pending Delete, serverHold).
+                    và <b>không bị chặn transfer</b> (serverTransferProhibited, pendingTransfer, Redemption / Pending Delete, serverHold).
+                    Riêng <b>clientTransferProhibited</b> vẫn báo vàng <b>Có thể chuyển</b> — cần liên hệ IT để mở khóa domain.
                     Dữ liệu lấy từ WHOIS/RDAP công khai nên chỉ mang tính tham khảo; một số ccTLD có quy định riêng và khi chuyển vẫn cần mã Auth/EPP từ registrar hiện tại.
                 </div>
             </div>
@@ -2424,6 +2492,25 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="rules-edit-grid" id="rulesEditor"><div class="skipped">Đang tải…</div></div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): CÀI ĐẶT KIỂM TRA ================= -->
+        <div class="tab-panel" id="tab-checkopts">
+            <div class="note-box">
+                <span class="note-icon">☑</span>
+                <div>
+                    <strong>Cài đặt kiểm tra áp dụng cho TẤT CẢ user.</strong>
+                    Mục nào được tick sẽ hiện trong phần "Cài đặt" của tab Kiểm tra mua domain để user chọn.
+                    Mục nào <b>không tick</b> thì user không thấy, không chọn được và hệ thống sẽ không chạy mục đó
+                    (ví dụ bỏ tick Cloudflare Banned để ngừng gọi API Cloudflare khi đang bị rate limit).
+                </div>
+            </div>
+            <div class="card">
+                <div class="section-title">Các mục kiểm tra cho phép</div>
+                <div id="aoList"><div class="skipped">Đang tải…</div></div>
+                <div class="msg err" id="aoMsg"></div>
+                <button class="btn-primary" id="btnAoSave" type="button" style="margin-top:14px;">Lưu cài đặt cho tất cả user</button>
+            </div>
         </div>
 
         <!-- ================= TAB (ADMIN): DOMAIN CẤM ================= -->
@@ -2660,7 +2747,30 @@ HTML_TEMPLATE = """
     <script>
         const CSRF_TOKEN = "{{ csrf_token }}";
         const modal = document.getElementById("settingsModal");
-        function openSettings() { modal.classList.add("show"); }
+        const CHECK_OPT_DEFS = {{ check_option_defs|tojson }};
+        let ALLOWED_OPTIONS = {{ check_options|tojson }};
+        function applyAllowedOptions() {
+            CHECK_OPT_DEFS.forEach(function(d) {
+                const k = d[0];
+                const box = document.getElementById('chk_' + k.replace('check_', ''));
+                if (!box) return;
+                const ok = ALLOWED_OPTIONS[k] !== false;
+                const item = box.closest('.settings-item');
+                if (item) item.style.display = ok ? '' : 'none';
+                if (!ok) { box.checked = false; box.dataset.off = '1'; }
+                else if (box.dataset.off === '1') { box.checked = true; delete box.dataset.off; }
+            });
+        }
+        async function refreshAllowedOptions() {
+            try {
+                const r = await fetch('/api/check-options', { headers: { 'X-CSRF-Token': CSRF_TOKEN } });
+                if (r.ok) {
+                    const d = await r.json();
+                    if (d && d.options) { ALLOWED_OPTIONS = d.options; applyAllowedOptions(); }
+                }
+            } catch (e) { /* giữ cấu hình hiện tại; server vẫn tự chặn mục không được phép */ }
+        }
+        function openSettings() { modal.classList.add("show"); refreshAllowedOptions(); }
         function closeSettings() { modal.classList.remove("show"); }
         window.onclick = function(e) { if (e.target === modal) closeSettings(); };
 
@@ -2668,14 +2778,15 @@ HTML_TEMPLATE = """
         let seenLegendKeys = new Set();
 
         function getOptions() {
-            return {
-                check_buy: document.getElementById('chk_buy').checked,
-                check_registrar: document.getElementById('chk_registrar').checked,
-                check_dates: document.getElementById('chk_dates').checked,
-                check_cf: document.getElementById('chk_cf').checked,
-                check_hold: document.getElementById('chk_hold').checked
-            };
+            const o = {};
+            CHECK_OPT_DEFS.forEach(function(d) {
+                const k = d[0];
+                const box = document.getElementById('chk_' + k.replace('check_', ''));
+                o[k] = ALLOWED_OPTIONS[k] !== false && !!(box && box.checked);
+            });
+            return o;
         }
+        applyAllowedOptions();
 
         function buildHeader(options) {
             const tr = document.getElementById('tableHeader');
@@ -2775,6 +2886,7 @@ HTML_TEMPLATE = """
         async function startCheck(isRetry = false) {
             const btn = document.getElementById('btnCheck');
             const btnRetry = document.getElementById('btnRetry');
+            await refreshAllowedOptions();
             const options = getOptions();
             const delay = Math.max(0, parseInt(document.getElementById('delayMs').value) || 500);
             let domains = [];
@@ -2927,6 +3039,7 @@ HTML_TEMPLATE = """
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('show', p.id === 'tab-' + name));
             if (!IS_ADMIN) return;
             if (name === 'rules' && !loaded.rules) loadRules();
+            if (name === 'checkopts') loadCheckOpts();
             if (name === 'blocks' && !loaded.blocks) loadBlocks();
 {% if is_admin %}
             if (name === 'keywords' && !loaded.keywords) loadKeywordsTab();
@@ -3072,6 +3185,29 @@ HTML_TEMPLATE = """
             try { data = await r.json(); } catch (e) { /* ignore */ }
             if (!r.ok) throw new Error(data.error || ('Lỗi ' + r.status));
             return data;
+        }
+
+        // ---- ADMIN: cài đặt kiểm tra cho tất cả user ----
+        async function loadCheckOpts() {
+            setMsg('aoMsg', '');
+            try {
+                const d = await adminApi('/api/admin/check-options');
+                el('aoList').innerHTML = CHECK_OPT_DEFS.map(function(x) {
+                    const id = 'ao_' + x[0];
+                    return '<div class="settings-item"><input type="checkbox" id="' + id + '"' +
+                        (d.options[x[0]] !== false ? ' checked' : '') + '><label for="' + id + '">' + esc(x[1]) + '</label></div>';
+                }).join('');
+            } catch (e) { setMsg('aoMsg', e.message, false); }
+        }
+        async function saveCheckOpts() {
+            const body = {};
+            CHECK_OPT_DEFS.forEach(function(x) { const b = el('ao_' + x[0]); body[x[0]] = !!(b && b.checked); });
+            try {
+                const d = await adminApi('/api/admin/check-options', { options: body });
+                ALLOWED_OPTIONS = d.options;
+                applyAllowedOptions();
+                setMsg('aoMsg', 'Đã lưu — áp dụng cho tất cả user', true);
+            } catch (e) { setMsg('aoMsg', e.message, false); }
         }
 
         // ---- ADMIN: mật khẩu ngẫu nhiên 8 ký tự ----
@@ -3227,6 +3363,7 @@ HTML_TEMPLATE = """
         renderRulesSummary();
         if (IS_ADMIN) {
             initBlockChips();
+            el('btnAoSave').addEventListener('click', saveCheckOpts);
             el('rulesEditor').addEventListener('click', e => {
                 const b = e.target.closest('button[data-act]');
                 if (b) ruleAction(b.closest('.reg-card'), b.dataset.act);
@@ -3746,6 +3883,7 @@ def index():
     return render_template_string(
         HTML_TEMPLATE, username=session["user"], csrf_token=session["csrf"],
         is_admin=is_admin(), registrars=REGISTRARS, rules_summary=rules_summary(),
+        check_options=get_check_options(), check_option_defs=CHECK_OPTIONS,
         gd_vat_pct=("%g" % (GD_VAT_RATE * 100)),
         gd_rate=format(int(round(GD_USD_VND)), ",").replace(",", "."),
     )
@@ -3762,7 +3900,8 @@ def api_check():
             return jsonify(error="Domain không hợp lệ", failed=True), 400
 
         options = data.get("options") or {}
-        opt = lambda k: bool(options.get(k, True))  # noqa: E731
+        allowed = get_check_options()          # admin không cho phép mục nào → mục đó KHÔNG BAO GIỜ chạy
+        opt = lambda k: bool(allowed.get(k, True)) and bool(options.get(k, True))  # noqa: E731
         check_buy, check_reg = opt("check_buy"), opt("check_registrar")
         check_hold, check_dates, check_cf = opt("check_hold"), opt("check_dates"), opt("check_cf")
 
@@ -3771,11 +3910,14 @@ def api_check():
         if check_buy or check_reg or check_hold or check_dates:
             info = get_domain_info(domain)
 
-        # ---- Cloudflare: bật cột CF, hoặc cần để chốt "có thể mua" (bỏ qua nếu domain đã có chủ / restricted) ----
-        already_taken = bool(info) and info["state"] in ("registered", "restricted")
+        # ---- Cloudflare: CHỈ gọi khi mục "Cloudflare Banned" được chọn (và admin cho phép) ----
         cf = None
-        if check_cf or (check_buy and not already_taken):
-            cf = check_cf_eligibility(domain)
+        if check_cf:
+            try:
+                cf = check_cf_eligibility(domain)
+            except Exception:  # noqa: BLE001  (lỗi CF không được làm hỏng các cột khác)
+                log.exception("Lỗi kiểm tra Cloudflare %r", domain)
+                cf = _cf_result(_badge("badge-danger", "Lỗi Call API CF"), failed=True)
             # WHOIS không chắc chắn nhưng CF báo "chưa ĐK" (1049) → dùng làm bằng chứng bổ sung
             if info and info["state"] == "unknown" and cf["unregistered"]:
                 info = _unregistered_info()
@@ -3785,15 +3927,15 @@ def api_check():
         if check_buy:
             results, tld_ok = check_buyability(domain)
             state = info["state"] if info else "unknown"
-            cf_ok = bool(cf) and not cf["failed"]
-            can_buy = state == "unregistered" and tld_ok and cf_ok and not cf["blocked"]
+            cf_bad = bool(cf) and (cf["failed"] or cf["blocked"])      # không chọn CF → bỏ qua hoàn toàn
+            can_buy = state == "unregistered" and tld_ok and not cf_bad
             buy_html = format_buyability_html(results, tld_ok, state, cf)
 
         # ---- Cờ lỗi để frontend đưa vào danh sách Retry ----
         failed = False
         if info and info["state"] == "unknown":
             failed = True
-        if cf and cf["failed"] and (check_cf or check_buy):
+        if cf and cf["failed"]:
             failed = True
 
         return jsonify({
@@ -3801,6 +3943,7 @@ def api_check():
             "buy_html": buy_html,
             "can_buy": can_buy,
             "cf_add_status": (cf["html"] if cf else "") if check_cf else "Bỏ qua",
+            "options": {k: opt(k) for k in CHECK_OPTION_KEYS},
             "registrar": (info["registrar"] if info else "Bỏ qua") if check_reg else "Bỏ qua",
             "status": (info["status_html"] if info else "Bỏ qua") if check_hold else "Bỏ qua",
             "created": info["created"] if (info and check_dates) else None,
@@ -3820,6 +3963,13 @@ def api_check():
             "expires": None,
             "failed": True,
         }), 500
+
+
+@app.route("/api/check-options", methods=["GET"])
+@user_read_guard
+def api_check_options():
+    """Các mục kiểm tra mà admin cho phép (user nào cũng đọc được)."""
+    return jsonify(options=get_check_options())
 
 
 @app.route("/api/transfer-check", methods=["POST"])
@@ -3973,6 +4123,38 @@ def api_admin_user_delete():
 
 
 # ---------------- ADMIN: đuôi cấm / cho phép ----------------
+@app.route("/api/admin/check-options", methods=["GET"])
+@admin_guard
+def api_admin_check_options():
+    return jsonify(options=get_check_options(force=True))
+
+
+@app.route("/api/admin/check-options", methods=["POST"])
+@admin_guard
+def api_admin_check_options_save():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    raw = data.get("options")
+    if not isinstance(raw, dict):
+        return jsonify(error="Dữ liệu không hợp lệ"), 400
+    opts = {k: bool(raw.get(k, False)) for k in CHECK_OPTION_KEYS}
+    if not any(opts.values()):
+        return jsonify(error="Phải bật ít nhất 1 mục kiểm tra"), 400
+    try:
+        db.app_settings.update_one(
+            {"_id": "check_options"},
+            {"$set": {"options": opts, "updated_at": _now(), "updated_by": session["user"]}},
+            upsert=True)
+    except PyMongoError:
+        log.exception("Lỗi lưu cài đặt kiểm tra")
+        return jsonify(error="Lỗi cơ sở dữ liệu — chưa lưu được"), 503
+    _invalidate_check_options()
+    log.info("Admin %s cập nhật cài đặt kiểm tra: %s", session["user"], opts)
+    return jsonify(ok=True, options=get_check_options(force=True))
+
+
 @app.route("/api/admin/rules", methods=["GET"])
 @admin_guard
 def api_admin_rules():
