@@ -5759,7 +5759,6 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
       <input type="text" id="customMention" placeholder="@custom..." disabled />
       <button class="btn btn-violet" data-cmd="step1">🔍 Lọc</button>
       <button class="btn btn-green" data-cmd="1">💡 Đề xuất</button>
-      <button class="btn btn-orange" data-cmd="lechgia">⚠️ Lệch giá</button>
       <button class="btn btn-red" id="btnClear">🗑️ Xóa tất cả</button>
     </div>
   </aside>
