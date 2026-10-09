@@ -700,7 +700,7 @@ def security_headers(resp):
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; "
-        "img-src 'self' data: https://cdn-icons-png.flaticon.com; "
+        "img-src 'self' data: https://cdn-icons-png.flaticon.com https://cms.spidyhost.com; "
         "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     )
     if request.path != "/healthz":
