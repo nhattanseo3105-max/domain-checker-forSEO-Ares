@@ -4708,6 +4708,7 @@ class CartData:
     total: Optional[float] = None
     tax_fees: Optional[float] = None
     currency: str = "USD"
+    extra_fee: float = 0.0   # phí nhập tay (Regery) – chia đều cho mọi domain trong cart
 
 def clean_domain(text: str) -> str:
     text = text.strip().lower()
@@ -4769,7 +4770,7 @@ def parse_original_list(text: str) -> List[OrderGroup]:
         if not block:
             continue
 
-        prov = re.match(r"^(NAMECHEAP|DYNADOT|GODADDY|SPACESHIP|SAV)\s*", block, re.I)
+        prov = re.match(r"^(NAMECHEAP|DYNADOT|GODADDY|SPACESHIP|REGERY|SAV)\s*", block, re.I)
         if prov:
             current_provider = prov.group(1).upper()
             block = block[prov.end() :].strip()
@@ -4839,6 +4840,8 @@ def parse_cart(text: str) -> CartData:
         provider = "GODADDY"
     elif "spaceship" in lower:
         provider = "SPACESHIP"
+    elif "regery" in lower:
+        provider = "REGERY"
     elif "sav" in lower:
         provider = "SAV"
 
@@ -4949,15 +4952,31 @@ def is_banned_via_mongo(domain: str, provider: str) -> bool:
         "SAV": "SAV"
     }
     reg = provider_map.get(provider.upper())
-    if not reg:
+    if not reg:   # REGERY / UNKNOWN: chưa có bộ quy tắc đuôi cấm riêng → không chặn
         return False
     results, can_buy = check_buyability(domain)
     # results format: { registrar: {"ok": bool, "reason": str} }
     # if it's not ok, it's banned/blocked
     return not results[reg]["ok"]
 
+def split_extra_fee(cart: CartData) -> Dict[str, float]:
+    """Chia đều cart.extra_fee cho TẤT CẢ domain trong cart (dư/thiếu do làm tròn dồn vào domain cuối)."""
+    fee = float(cart.extra_fee or 0.0)
+    doms = list(OrderedDict.fromkeys(i.domain for i in cart.items))
+    if not doms or fee == 0:
+        return {d: 0.0 for d in doms}
+    nd = 0 if (cart.currency or "USD") == "VND" else 2
+    share = round(fee / len(doms), nd)
+    out = {d: share for d in doms}
+    out[doms[-1]] = round(fee - share * (len(doms) - 1), nd)
+    return out
+
 def get_final_prices(cart: CartData) -> Dict[str, float]:
-    return {item.domain: item.price + item.icann for item in cart.items}
+    fee_share = split_extra_fee(cart)
+    prices: Dict[str, float] = {}
+    for item in cart.items:
+        prices[item.domain] = item.price + item.icann + fee_share.get(item.domain, 0.0)
+    return prices
 
 def allocate_tax_fees(cart: CartData, domains: List[str]) -> Dict[str, float]:
     base = get_final_prices(cart)
@@ -4973,7 +4992,7 @@ def allocate_tax_fees(cart: CartData, domains: List[str]) -> Dict[str, float]:
 
     target_total = None
     if cart.total is not None and cart.total > 0:
-        target_total = cart.total
+        target_total = cart.total + (cart.extra_fee or 0.0)
     elif cart.tax_fees is not None and cart.tax_fees != 0 and sum_base > 0:
         target_total = sum_base + cart.tax_fees
 
@@ -5130,6 +5149,7 @@ def output_step2_text(result: Dict) -> str:
         "DYNADOT": "Dynadot",
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
+        "REGERY": "Regery",
     }.get(result["provider"], result["provider"])
 
     lines = []
@@ -5199,6 +5219,7 @@ def output_command_1(result: Dict, mention: str) -> str:
         "DYNADOT": "Dynadot",
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
+        "REGERY": "Regery",
     }.get(provider, provider)
 
     lines = [f"{mention} cần thanh toán domain cho SEO:", f"* Nhà cung cấp: {display}", ""]
@@ -5217,7 +5238,7 @@ def output_command_1(result: Dict, mention: str) -> str:
         lines.append("")
 
     if cart.total is not None:
-        total = cart.total
+        total = cart.total + (cart.extra_fee or 0.0)
     else:
         total = sum(allocated.values()) if allocated else 0.0
 
@@ -5240,6 +5261,7 @@ def output_command_2(result: Dict) -> str:
         "DYNADOT": "Dynadot",
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
+        "REGERY": "Regery",
     }.get(provider, provider)
 
     valid_all = [
@@ -5344,14 +5366,35 @@ def output_lech_gia(result: Dict) -> str:
     lines.append("nhờ TT, TP kiểm tra và duyệt mua giúp em")
     return "\n".join(lines).strip()
 
+def parse_fee(value) -> float:
+    """Đọc ô fee người dùng nhập ('1.5', '1,5', '$2'...). Rỗng/sai → 0."""
+    if value is None or str(value).strip() == "":
+        return 0.0
+    try:
+        v, _ = parse_price(str(value))
+        return max(float(v), 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+def build_cart(cart_text: str, groups: List[OrderGroup], fee=0.0) -> CartData:
+    """parse_cart + gắn fee nhập tay nếu nhà cung cấp là Regery."""
+    cart = parse_cart(cart_text)
+    prov = cart.provider
+    if prov == "UNKNOWN" and groups:
+        prov = groups[0].provider
+    if prov == "REGERY":
+        cart.provider = "REGERY"
+        cart.extra_fee = parse_fee(fee)
+    return cart
+
 def process(
-    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003"
+    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003", fee=0.0
 ) -> str:
     groups = parse_original_list(original_text)
     if command == "step1":
         return output_step1(groups) if groups else "Thiếu dữ liệu để xử lý."
 
-    cart = parse_cart(cart_text)
+    cart = build_cart(cart_text, groups, fee)
     if not groups or not cart.items:
         return "Thiếu dữ liệu để xử lý."
 
@@ -5368,9 +5411,9 @@ def process(
 
     return ""
 
-def result_summary(original_text: str, cart_text: str) -> Optional[Dict]:
+def result_summary(original_text: str, cart_text: str, fee=0.0) -> Optional[Dict]:
     groups = parse_original_list(original_text)
-    cart = parse_cart(cart_text)
+    cart = build_cart(cart_text, groups, fee)
     if not groups or not cart.items:
         return None
     r = compare(groups, cart)
@@ -5380,6 +5423,7 @@ def result_summary(original_text: str, cart_text: str) -> Optional[Dict]:
         "DYNADOT": "Dynadot",
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
+        "REGERY": "Regery",
     }.get(r["provider"], r["provider"])
 
     price_diff_fmt = []
@@ -5770,7 +5814,14 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
         <textarea id="original" placeholder="Dán danh sách gốc (NAMECHEAP / DYNADOT / … + DM-xxx)…" spellcheck="false"></textarea>
       </div>
       <div class="panel">
-        <div class="panel-head">Cart (từ Tampermonkey)</div>
+        <div class="panel-head">
+          <span>Cart (từ Tampermonkey)</span>
+          <label id="feeBox" style="display:none;align-items:center;gap:6px;font-weight:600;font-size:.82rem;color:var(--muted)" title="Fee Regery — sẽ chia đều cho tất cả domain trong cart">
+            Fee (USD)
+            <input type="text" id="regeryFee" inputmode="decimal" placeholder="0.00" autocomplete="off"
+                   style="width:90px;padding:4px 8px;border:1px solid var(--border);border-radius:8px;font-size:.85rem" />
+          </label>
+        </div>
         <textarea id="cart" placeholder="Dán nội dung cart từ nhà cung cấp…" spellcheck="false"></textarea>
       </div>
     </div>
@@ -5820,6 +5871,20 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add("show");
   setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+function isRegery() {
+  return /regery/i.test($("#cart").value) || /^\s*regery\b/im.test($("#original").value);
+}
+function syncFeeBox() {
+  const show = isRegery();
+  $("#feeBox").style.display = show ? "inline-flex" : "none";
+}
+$("#cart").addEventListener("input", syncFeeBox);
+$("#original").addEventListener("input", syncFeeBox);
+
+function getFee() {
+  return isRegery() ? ($("#regeryFee").value || "").trim() : "";
 }
 
 function getMention() {
@@ -6012,6 +6077,7 @@ async function run(cmd) {
         cart,
         command: cmd,
         mention: getMention(),
+        fee: getFee(),
       }),
     });
     const data = await res.json();
@@ -6063,6 +6129,8 @@ function clearAll() {
   $("#original").value = "";
   $("#cart").value = "";
   $("#result").value = "";
+  $("#regeryFee").value = "";
+  syncFeeBox();
   resetCheckPanel();
   updateBeastButton("", []);
   $("#status").textContent = "Đã xóa tất cả · Hotkey: 1 = Đề xuất · 2 = DS import · Esc×3 = Xóa";
@@ -6166,11 +6234,12 @@ def api_cart_checker_run():
     cart = str(data.get("cart") or "")
     command = str(data.get("command") or "")
     mention = str(data.get("mention") or "@Pii_S8_003")
-    
+    fee = data.get("fee")
+
     if command not in ("step1", "step2", "1", "2", "lechgia"):
         return jsonify(error="Lệnh không hợp lệ"), 400
     try:
-        text = process(original, cart, command, mention)
+        text = process(original, cart, command, mention, fee)
         summary = None
         provider = None
         domains = None
@@ -6181,10 +6250,10 @@ def api_cart_checker_run():
                 provider = groups[0].provider
                 domains = [d.domain for g in groups for d in g.domains]
         else:
-            summary = result_summary(original, cart)
+            summary = result_summary(original, cart, fee)
             if command in ("1", "2"):
                 groups = parse_original_list(original)
-                cart_obj = parse_cart(cart)
+                cart_obj = build_cart(cart, groups, fee)
                 if groups and cart_obj.items:
                     result_obj = compare(groups, cart_obj)
                     ds_import = output_command_2(result_obj)
