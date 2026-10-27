@@ -4770,9 +4770,9 @@ def parse_original_list(text: str) -> List[OrderGroup]:
         if not block:
             continue
 
-        prov = re.match(r"^(NAMECHEAP|DYNADOT|GODADDY|SPACESHIP|REGERY|SAV)\s*", block, re.I)
+        prov = re.match(r"^(NAMECHEAP|DYNADOT|GODADDY|SPACESHIP|REGERY|HOST\s*HONG\s*KONG|SAV)\s*", block, re.I)
         if prov:
-            current_provider = prov.group(1).upper()
+            current_provider = re.sub(r"\s+", "", prov.group(1)).upper()
             block = block[prov.end() :].strip()
 
         header = re.match(r"(DM-[A-Z0-9]+)\s*-\s*(.+)", block, re.I | re.DOTALL)
@@ -4842,6 +4842,8 @@ def parse_cart(text: str) -> CartData:
         provider = "SPACESHIP"
     elif "regery" in lower:
         provider = "REGERY"
+    elif re.search(r"host\s*hong\s*kong", lower):
+        provider = "HOSTHONGKONG"
     elif "sav" in lower:
         provider = "SAV"
 
@@ -5150,6 +5152,7 @@ def output_step2_text(result: Dict) -> str:
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
         "REGERY": "Regery",
+        "HOSTHONGKONG": "HostHongKong",
     }.get(result["provider"], result["provider"])
 
     lines = []
@@ -5195,7 +5198,14 @@ def output_step2_text(result: Dict) -> str:
 
     return "\n".join(lines)
 
-def output_command_1(result: Dict, mention: str) -> str:
+DEFAULT_TRC20_WALLET = "TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy"
+
+def clean_wallet(value) -> str:
+    """Chuẩn hóa địa chỉ ví từ ô input: bỏ khoảng trắng/xuống dòng, giới hạn độ dài; rỗng → ví mặc định."""
+    w = re.sub(r"\s+", "", str(value or ""))[:100]
+    return w or DEFAULT_TRC20_WALLET
+
+def output_command_1(result: Dict, mention: str, wallet: str = "") -> str:
     provider = result["provider"]
     cart = result["cart"]
     currency = cart.currency or "USD"
@@ -5220,6 +5230,7 @@ def output_command_1(result: Dict, mention: str) -> str:
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
         "REGERY": "Regery",
+        "HOSTHONGKONG": "HostHongKong",
     }.get(provider, provider)
 
     lines = [f"{mention} cần thanh toán domain cho SEO:", f"* Nhà cung cấp: {display}", ""]
@@ -5247,6 +5258,9 @@ def output_command_1(result: Dict, mention: str) -> str:
     else:
         lines.append(f"Tổng số tiền thanh toán: {format_usd_total(total)}")
 
+    lines.append("TRC20")
+    lines.append(clean_wallet(wallet))
+
     return "\n".join(lines)
 
 def output_command_2(result: Dict) -> str:
@@ -5262,6 +5276,7 @@ def output_command_2(result: Dict) -> str:
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
         "REGERY": "Regery",
+        "HOSTHONGKONG": "HostHongKong",
     }.get(provider, provider)
 
     valid_all = [
@@ -5388,7 +5403,7 @@ def build_cart(cart_text: str, groups: List[OrderGroup], fee=0.0) -> CartData:
     return cart
 
 def process(
-    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003", fee=0.0
+    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003", fee=0.0, wallet: str = ""
 ) -> str:
     groups = parse_original_list(original_text)
     if command == "step1":
@@ -5403,7 +5418,7 @@ def process(
     if command == "step2":
         return output_step2_text(result)
     if command == "1":
-        return output_command_1(result, mention)
+        return output_command_1(result, mention, wallet)
     if command == "2":
         return output_command_2(result)
     if command == "lechgia":
@@ -5424,6 +5439,7 @@ def result_summary(original_text: str, cart_text: str, fee=0.0) -> Optional[Dict
         "SPACESHIP": "Spaceship",
         "SAV": "SAV",
         "REGERY": "Regery",
+        "HOSTHONGKONG": "HostHongKong",
     }.get(r["provider"], r["provider"])
 
     price_diff_fmt = []
@@ -5801,6 +5817,9 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
         <option value="__custom__">Custom...</option>
       </select>
       <input type="text" id="customMention" placeholder="@custom..." disabled />
+      <label class="field" for="walletInput">Ví TRC20</label>
+      <input type="text" id="walletInput" placeholder="Địa chỉ ví TRC20" autocomplete="off" spellcheck="false"
+             value="TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
       <button class="btn btn-violet" data-cmd="step1">🔍 Lọc</button>
       <button class="btn btn-green" data-cmd="1">💡 Đề xuất</button>
       <button class="btn btn-red" id="btnClear">🗑️ Xóa tất cả</button>
@@ -5811,7 +5830,7 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
     <div class="panels">
       <div class="panel">
         <div class="panel-head">Danh sách gốc (Input)</div>
-        <textarea id="original" placeholder="Dán danh sách gốc (NAMECHEAP / DYNADOT / … + DM-xxx)…" spellcheck="false"></textarea>
+        <textarea id="original" placeholder="Dán danh sách gốc (NAMECHEAP / DYNADOT / HOSTHONGKONG / … + DM-xxx)…" spellcheck="false"></textarea>
       </div>
       <div class="panel">
         <div class="panel-head">
@@ -5885,6 +5904,30 @@ $("#original").addEventListener("input", syncFeeBox);
 
 function getFee() {
   return isRegery() ? ($("#regeryFee").value || "").trim() : "";
+}
+
+const DEFAULT_WALLET = "TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy";
+const WALLET_KEY = "cart_checker_trc20_wallet";
+(function initWallet() {
+  const el = $("#walletInput");
+  try {
+    const saved = localStorage.getItem(WALLET_KEY);
+    el.value = (saved && saved.trim()) || DEFAULT_WALLET;
+  } catch (e) { el.value = DEFAULT_WALLET; }
+  const save = () => {
+    const v = (el.value || "").replace(/\s+/g, "");
+    el.value = v;
+    try { localStorage.setItem(WALLET_KEY, v || DEFAULT_WALLET); } catch (e) {}
+  };
+  el.addEventListener("input", save);
+  el.addEventListener("change", () => {
+    save();
+    if (!el.value) el.value = DEFAULT_WALLET;
+    toast("Đã lưu địa chỉ ví");
+  });
+})();
+function getWallet() {
+  return ($("#walletInput").value || "").replace(/\s+/g, "") || DEFAULT_WALLET;
 }
 
 function getMention() {
@@ -6078,6 +6121,7 @@ async function run(cmd) {
         command: cmd,
         mention: getMention(),
         fee: getFee(),
+        wallet: getWallet(),
       }),
     });
     const data = await res.json();
@@ -6235,11 +6279,12 @@ def api_cart_checker_run():
     command = str(data.get("command") or "")
     mention = str(data.get("mention") or "@Pii_S8_003")
     fee = data.get("fee")
+    wallet = clean_wallet(data.get("wallet"))
 
     if command not in ("step1", "step2", "1", "2", "lechgia"):
         return jsonify(error="Lệnh không hợp lệ"), 400
     try:
-        text = process(original, cart, command, mention, fee)
+        text = process(original, cart, command, mention, fee, wallet)
         summary = None
         provider = None
         domains = None
