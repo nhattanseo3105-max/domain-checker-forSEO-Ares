@@ -5258,8 +5258,10 @@ def output_command_1(result: Dict, mention: str, wallet: str = "") -> str:
     else:
         lines.append(f"Tổng số tiền thanh toán: {format_usd_total(total)}")
 
-    lines.append("TRC20")
-    lines.append(clean_wallet(wallet))
+    # Chỉ HostHongKong mới thanh toán qua TRC20 → chỉ NCC này mới thêm dòng ví
+    if provider == "HOSTHONGKONG":
+        lines.append("TRC20")
+        lines.append(clean_wallet(wallet))
 
     return "\n".join(lines)
 
