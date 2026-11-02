@@ -1646,11 +1646,20 @@ def gd_fixed_price_for(domain):
 
 
 def check_godaddy_price(domain):
+    """Gọi GoDaddy để xác nhận domain còn đăng ký được; nếu đuôi có giá cố định (admin set)
+    thì thay giá bằng giá cố định. Domain không khả dụng / lỗi API / premium → giữ nguyên kết quả GoDaddy.
+    Kết quả GoDaddy được cache thô, giá cố định áp lúc trả về nên admin sửa là có hiệu lực ngay."""
+    out = _check_godaddy_price_raw(domain)
+    if out.get("state") in ("ok", "noprice") and not out.get("failed") and not out.get("premium"):
+        fixed = gd_fixed_price_for(domain)
+        if fixed is not None:
+            return _gd_result("ok", _badge("badge-success", "CÓ GIÁ"), price_vnd=fmt_fixed_price(fixed) + " ₫")
+    return out
+
+
+def _check_godaddy_price_raw(domain):
     """Giá đăng ký mới 1 năm trên GoDaddy (API v3, chỉ đọc) + VAT + quy đổi VNĐ."""
     global _gd_block_until
-    fixed = gd_fixed_price_for(domain)          # admin set cứng giá theo đuôi → trả luôn, không gọi GoDaddy
-    if fixed is not None:
-        return _gd_result("ok", _badge("badge-success", "CÓ GIÁ"), price_vnd=fmt_fixed_price(fixed) + " ₫")
     if not GODADDY_PAT:
         return _gd_result("nokey", _badge("badge-muted", "Thiếu API GoDaddy"))
 
@@ -1697,7 +1706,10 @@ def check_godaddy_price(domain):
     except ValueError:
         return _gd_result("error", _badge("badge-muted", "GoDaddy trả phản hồi không hợp lệ"), failed=True)
 
-    out = _gd_build_price(data if isinstance(data, dict) else {})
+    data = data if isinstance(data, dict) else {}
+    out = _gd_build_price(data)
+    inv = str(data.get("inventory") or "")
+    out["premium"] = bool(inv) and inv.upper() != "REGISTRY"     # domain premium → không áp giá cố định
     if not out["failed"]:
         with _gd_cache_lock:
             if len(_gd_cache) > 5000:
@@ -2622,7 +2634,7 @@ HTML_TEMPLATE = """
                     Mỗi dòng 1 đuôi theo dạng <code>đuôi,giá</code>, ví dụ <code>.com.co,200.000</code> → mọi domain đuôi .com.co sẽ báo <b>200.000 ₫</b>.<br>
                     Giá nhập là <b>VNĐ đã gồm {{ gd_vat_pct }}% thuế và phí</b> (hiển thị đúng như nhập, không cộng thêm gì nữa).
                     Nhập <code>200.000</code> hay <code>200,000</code> đều được — hệ thống tự chuyển sang dấu chấm.<br>
-                    Đuôi dài hơn thắng đuôi ngắn (<code>.com.co</code> thắng <code>.co</code>). Đuôi có giá cố định sẽ không gọi API GoDaddy. Dòng bắt đầu bằng <code>#</code> bị bỏ qua.
+                    Đuôi dài hơn thắng đuôi ngắn (<code>.com.co</code> thắng <code>.co</code>). Hệ thống vẫn hỏi GoDaddy xem domain còn đăng ký được không; chỉ khi còn trống mới thay bằng giá cố định (domain đã bị đăng ký, premium hoặc lỗi API giữ nguyên kết quả GoDaddy). Dòng bắt đầu bằng <code>#</code> bị bỏ qua.
                 </div>
             </div>
             <div class="card">
@@ -5375,7 +5387,7 @@ def output_step2_text(result: Dict) -> str:
 
     return "\n".join(lines)
 
-DEFAULT_TRC20_WALLET = "TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy"
+DEFAULT_TRC20_WALLET = "TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k"
 
 def clean_wallet(value) -> str:
     """Chuẩn hóa địa chỉ ví từ ô input: bỏ khoảng trắng/xuống dòng, giới hạn độ dài; rỗng → ví mặc định."""
@@ -5998,7 +6010,7 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
       <input type="text" id="customMention" placeholder="@custom..." disabled />
       <label class="field" for="walletInput">Ví TRC20</label>
       <input type="text" id="walletInput" placeholder="Địa chỉ ví TRC20" autocomplete="off" spellcheck="false"
-             value="TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
+             value="TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
       <button class="btn btn-violet" data-cmd="step1">🔍 Lọc</button>
       <button class="btn btn-green" data-cmd="1">💡 Đề xuất</button>
       <button class="btn btn-red" id="btnClear">🗑️ Xóa tất cả</button>
@@ -6085,7 +6097,7 @@ function getFee() {
   return isRegery() ? ($("#regeryFee").value || "").trim() : "";
 }
 
-const DEFAULT_WALLET = "TKKubaDWpTgqwULpvCD9hBzRhNC9vHsCyy";
+const DEFAULT_WALLET = "TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k";
 const WALLET_KEY = "cart_checker_trc20_wallet";
 (function initWallet() {
   const el = $("#walletInput");
