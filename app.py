@@ -1549,9 +1549,108 @@ def _gd_build_price(data):
                       price_usd=_fmt_usd(base), price_vat=_fmt_usd(with_vat), price_vnd=_fmt_vnd(vnd))
 
 
+# ---------- Giá cố định theo đuôi (admin set) — giá VNĐ đã gồm VAT + phí, không gọi API GoDaddy ----------
+_GD_FIXED_ID = "gd_fixed_prices"
+GD_FIXED_TTL = 10
+GD_FIXED_MAX = 500
+GD_FIXED_MAX_VND = 10 ** 10
+_gd_fixed_cache = {"ts": -1e9, "val": {}}
+_gd_fixed_lock = threading.Lock()
+_FIXED_LINE_RE = re.compile(r"^(\S+?)\s*[,;\s]\s*(\S.*)$")
+_FIXED_PRICE_RE = re.compile(r"^(?:\d+|\d{1,3}(?:[.,]\d{3})+)$")
+
+
+def parse_fixed_price(raw):
+    """'200.000' / '200,000' / '200000' / '1.200.000 đ' → 200000 ; sai định dạng → None."""
+    t = re.sub(r"(?i)(vn[dđ]|đ|₫)\s*$", "", str(raw).strip()).replace(" ", "")
+    if not _FIXED_PRICE_RE.match(t):
+        return None
+    n = int(re.sub(r"\D", "", t))
+    return n if 0 < n < GD_FIXED_MAX_VND else None
+
+
+def fmt_fixed_price(n):
+    return format(int(n), ",").replace(",", ".")
+
+
+def parse_fixed_price_text(text):
+    """Mỗi dòng 'đuôi,giá' → ({'.com.co': 200000}, [lỗi...]). Dòng trống / bắt đầu bằng # bị bỏ qua."""
+    items, errors = {}, []
+    for no, line in enumerate(str(text or "").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _FIXED_LINE_RE.match(line)
+        if not m:
+            errors.append(f"Dòng {no}: cần dạng  .đuôi,giá  (vd .com.co,200.000)")
+            continue
+        suffix = normalize_suffix(m.group(1))
+        if not suffix or suffix.startswith("*"):
+            errors.append(f"Dòng {no}: đuôi \"{m.group(1)}\" không hợp lệ")
+            continue
+        price = parse_fixed_price(m.group(2))
+        if price is None:
+            errors.append(f"Dòng {no}: giá \"{m.group(2)}\" không hợp lệ (chỉ nhập số, vd 200.000 hoặc 200,000)")
+            continue
+        items[suffix] = price            # trùng đuôi → dòng sau ghi đè dòng trước
+    if len(items) > GD_FIXED_MAX:
+        errors.append(f"Tối đa {GD_FIXED_MAX} đuôi")
+    return items, errors
+
+
+def fixed_prices_to_text(items):
+    return "\n".join(f"{k},{fmt_fixed_price(v)}" for k, v in sorted(items.items()))
+
+
+def _invalidate_gd_fixed():
+    with _gd_fixed_lock:
+        _gd_fixed_cache["ts"] = -1e9
+
+
+def get_gd_fixed_prices(force=False):
+    """→ {'.com.co': 200000, ...} — cache 10s; MongoDB lỗi thì dùng bản cache cũ."""
+    now = time.monotonic()
+    with _gd_fixed_lock:
+        if not force and now - _gd_fixed_cache["ts"] < GD_FIXED_TTL:
+            return dict(_gd_fixed_cache["val"])
+        db = get_db()
+        if db is None:
+            _gd_fixed_cache["ts"] = now - GD_FIXED_TTL + 3
+            return dict(_gd_fixed_cache["val"])
+        try:
+            doc = db.app_settings.find_one({"_id": _GD_FIXED_ID}) or {}
+            val = {}
+            for it in doc.get("items") or []:
+                sfx, pr = normalize_suffix(it.get("suffix", "")), it.get("price")
+                if sfx and not sfx.startswith("*") and isinstance(pr, int) and pr > 0:
+                    val[sfx] = pr
+            _gd_fixed_cache.update(ts=now, val=val)
+        except PyMongoError as e:
+            log.error("Lỗi đọc giá cố định GoDaddy từ MongoDB: %s", e)
+            _gd_fixed_cache["ts"] = now - GD_FIXED_TTL + 3
+        return dict(_gd_fixed_cache["val"])
+
+
+def gd_fixed_price_for(domain):
+    """Giá cố định (VNĐ) của domain nếu đuôi của nó được admin set; đuôi dài nhất thắng
+    (abc.com.co → ưu tiên '.com.co' trước '.co'). Không có → None."""
+    fixed = get_gd_fixed_prices()
+    if not fixed:
+        return None
+    labels = domain.lower().strip().rstrip(".").split(".")
+    for i in range(1, len(labels)):
+        price = fixed.get("." + ".".join(labels[i:]))
+        if price is not None:
+            return price
+    return None
+
+
 def check_godaddy_price(domain):
     """Giá đăng ký mới 1 năm trên GoDaddy (API v3, chỉ đọc) + VAT + quy đổi VNĐ."""
     global _gd_block_until
+    fixed = gd_fixed_price_for(domain)          # admin set cứng giá theo đuôi → trả luôn, không gọi GoDaddy
+    if fixed is not None:
+        return _gd_result("ok", _badge("badge-success", "CÓ GIÁ"), price_vnd=fmt_fixed_price(fixed) + " ₫")
     if not GODADDY_PAT:
         return _gd_result("nokey", _badge("badge-muted", "Thiếu API GoDaddy"))
 
@@ -2245,6 +2344,7 @@ HTML_TEMPLATE = """
             <span class="tab-sep"></span>
             <button class="tab-btn" data-tab="rules">⚙ Đuôi cấm / cho phép</button>
             <button class="tab-btn" data-tab="checkopts">☑ Cài đặt kiểm tra</button>
+            <button class="tab-btn" data-tab="gdfixed">💰 Giá cố định GoDaddy</button>
             <button class="tab-btn" data-tab="blocks">🚫 Domain cấm (ẩn)</button>
             <button class="tab-btn" data-tab="keywords">🔤 Cấm Keyword</button>
             <button class="tab-btn" data-tab="notices">📢 Thông báo</button>
@@ -2510,6 +2610,29 @@ HTML_TEMPLATE = """
                 <div id="aoList"><div class="skipped">Đang tải…</div></div>
                 <div class="msg err" id="aoMsg"></div>
                 <button class="btn-primary" id="btnAoSave" type="button" style="margin-top:14px;">Lưu cài đặt cho tất cả user</button>
+            </div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): GIÁ CỐ ĐỊNH GODADDY ================= -->
+        <div class="tab-panel" id="tab-gdfixed">
+            <div class="note-box">
+                <span class="note-icon">💰</span>
+                <div>
+                    <strong>Set cứng giá theo đuôi domain cho tab "Kiểm tra giá mua mới GoDaddy".</strong>
+                    Mỗi dòng 1 đuôi theo dạng <code>đuôi,giá</code>, ví dụ <code>.com.co,200.000</code> → mọi domain đuôi .com.co sẽ báo <b>200.000 ₫</b>.<br>
+                    Giá nhập là <b>VNĐ đã gồm {{ gd_vat_pct }}% thuế và phí</b> (hiển thị đúng như nhập, không cộng thêm gì nữa).
+                    Nhập <code>200.000</code> hay <code>200,000</code> đều được — hệ thống tự chuyển sang dấu chấm.<br>
+                    Đuôi dài hơn thắng đuôi ngắn (<code>.com.co</code> thắng <code>.co</code>). Đuôi có giá cố định sẽ không gọi API GoDaddy. Dòng bắt đầu bằng <code>#</code> bị bỏ qua.
+                </div>
+            </div>
+            <div class="card">
+                <div class="section-title">Danh sách giá cố định</div>
+                <textarea class="field field-mono" id="gfInput" style="height:240px" placeholder=".com.co,200.000&#10;.xyz,150000&#10;.net.vn,1,200,000"></textarea>
+                <div class="action-bar">
+                    <button class="btn-primary" id="btnGfSave" type="button">Lưu giá cố định</button>
+                    <button class="btn-secondary" id="btnGfReload" type="button">↻ Tải lại</button>
+                    <span class="msg" id="gfMsg"></span>
+                </div>
             </div>
         </div>
 
@@ -3040,6 +3163,7 @@ HTML_TEMPLATE = """
             if (!IS_ADMIN) return;
             if (name === 'rules' && !loaded.rules) loadRules();
             if (name === 'checkopts') loadCheckOpts();
+            if (name === 'gdfixed') loadGdFixed();
             if (name === 'blocks' && !loaded.blocks) loadBlocks();
 {% if is_admin %}
             if (name === 'keywords' && !loaded.keywords) loadKeywordsTab();
@@ -3210,6 +3334,22 @@ HTML_TEMPLATE = """
             } catch (e) { setMsg('aoMsg', e.message, false); }
         }
 
+        // ---- ADMIN: giá cố định GoDaddy theo đuôi ----
+        async function loadGdFixed() {
+            setMsg('gfMsg', '');
+            try {
+                const d = await adminApi('/api/admin/gd-prices');
+                el('gfInput').value = d.text || '';
+            } catch (e) { setMsg('gfMsg', e.message, false); }
+        }
+        async function saveGdFixed() {
+            try {
+                const d = await adminApi('/api/admin/gd-prices', { text: el('gfInput').value });
+                el('gfInput').value = d.text || '';
+                setMsg('gfMsg', 'Đã lưu ' + d.count + ' đuôi — áp dụng ngay cho tab giá GoDaddy', true);
+            } catch (e) { setMsg('gfMsg', e.message, false); }
+        }
+
         // ---- ADMIN: mật khẩu ngẫu nhiên 8 ký tự ----
         function randInt(n) {
             const a = new Uint32Array(1);
@@ -3364,6 +3504,8 @@ HTML_TEMPLATE = """
         if (IS_ADMIN) {
             initBlockChips();
             el('btnAoSave').addEventListener('click', saveCheckOpts);
+            el('btnGfSave').addEventListener('click', saveGdFixed);
+            el('btnGfReload').addEventListener('click', loadGdFixed);
             el('rulesEditor').addEventListener('click', e => {
                 const b = e.target.closest('button[data-act]');
                 if (b) ruleAction(b.closest('.reg-card'), b.dataset.act);
@@ -4009,6 +4151,41 @@ def api_price_check():
             "domain": domain or "Unknown", "state": "error", "failed": True,
             "result_html": _badge("badge-danger", "Lỗi"), "price_usd": "", "price_vat": "", "price_vnd": "",
         }), 500
+
+
+# ---------------- ADMIN: giá cố định GoDaddy theo đuôi ----------------
+@app.route("/api/admin/gd-prices", methods=["GET"])
+@admin_guard
+def api_admin_gd_prices():
+    items = get_gd_fixed_prices(force=True)
+    return jsonify(text=fixed_prices_to_text(items), count=len(items))
+
+
+@app.route("/api/admin/gd-prices", methods=["POST"])
+@admin_guard
+def api_admin_gd_prices_save():
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    text = data.get("text")
+    if not isinstance(text, str) or len(text) > 100000:
+        return jsonify(error="Dữ liệu không hợp lệ"), 400
+    items, errors = parse_fixed_price_text(text)
+    if errors:
+        return jsonify(error=" · ".join(errors[:5]) + (f" · (+{len(errors) - 5} lỗi nữa)" if len(errors) > 5 else "")), 400
+    try:
+        db.app_settings.update_one(
+            {"_id": _GD_FIXED_ID},
+            {"$set": {"items": [{"suffix": k, "price": v} for k, v in sorted(items.items())],
+                      "updated_at": _now(), "updated_by": session["user"]}},
+            upsert=True)
+    except PyMongoError:
+        log.exception("Lỗi lưu giá cố định GoDaddy")
+        return jsonify(error="Lỗi cơ sở dữ liệu — chưa lưu được"), 503
+    _invalidate_gd_fixed()
+    log.info("Admin %s cập nhật giá cố định GoDaddy (%d đuôi)", session["user"], len(items))
+    return jsonify(ok=True, text=fixed_prices_to_text(items), count=len(items))
 
 
 # ---------------- ADMIN: tài khoản ----------------
