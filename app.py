@@ -1,5 +1,6 @@
 import copy
 import getpass
+import hashlib
 import hmac
 import html
 import logging
@@ -179,6 +180,9 @@ def _ensure_extra_schema(db):
         # tối đa 1 thông báo đang bật tại một thời điểm (ép ở tầng DB, chống race giữa 2 request)
         db.admin_notifications.create_index(
             "is_active", unique=True, partialFilterExpression={"is_active": True}, name="uniq_active_notice")
+        # lịch sử đề xuất của Cart Checker: Mongo tự xóa khi tới expires_at (TTL index)
+        db.cart_history.create_index("expires_at", expireAfterSeconds=0, name="ttl_cart_history")
+        db.cart_history.create_index([("user", 1), ("key", 1)], unique=True, name="uniq_cart_history_key")
     except PyMongoError as e:
         log.error("Không tạo được index cho keyword cấm / thông báo (tính năng vẫn chạy, "
                   "nhưng hãy kiểm tra quyền createIndex): %s", e)
@@ -5098,13 +5102,18 @@ def parse_cart(text: str) -> CartData:
 
     total = None
     total_currency = "USD"
-    for idx, ln in enumerate(lines):
-        if re.match(r"^(total|subtotal)\b", ln, re.I):
-            rest = re.sub(r"^(total|subtotal)\b[:\s]*", "", ln, flags=re.I).strip()
-            if rest and re.search(r"\d", rest):
-                total, total_currency = parse_price(rest)
-            elif idx + 1 < len(lines) and re.search(r"\d", lines[idx + 1]):
-                total, total_currency = parse_price(lines[idx + 1])
+    # ưu tiên dòng "Total"; không có mới dùng "Subtotal"
+    for key in ("total", "subtotal"):
+        for idx, ln in enumerate(lines):
+            if re.match(rf"^{key}\b", ln, re.I):
+                rest = re.sub(rf"^{key}\b[:\s]*", "", ln, flags=re.I).strip()
+                if rest and re.search(r"\d", rest):
+                    total, total_currency = parse_price(rest)
+                elif idx + 1 < len(lines) and re.search(r"\d", lines[idx + 1]):
+                    total, total_currency = parse_price(lines[idx + 1])
+                if total is not None:
+                    break
+        if total is not None:
             break
 
     tax_fees = None
@@ -5170,42 +5179,35 @@ def get_final_prices(cart: CartData) -> Dict[str, float]:
     return prices
 
 def allocate_tax_fees(cart: CartData, domains: List[str]) -> Dict[str, float]:
+    """Giá mỗi domain = giá niêm yết + ICANN (+ fee Regery chia đều).
+    Chỉ khi tổng giỏ hàng CAO HƠN tổng các dòng (tức có thuế/phí phát sinh) thì phần chênh mới được
+    chia theo tỷ lệ cho các domain. Total thấp hơn (giảm giá / Subtotal không gồm ICANN) → giữ nguyên giá dòng."""
     base = get_final_prices(cart)
-    currency = cart.currency or "USD"
-    is_vnd = currency == "VND"
+    is_vnd = (cart.currency or "USD") == "VND"
+    nd = 0 if is_vnd else 2
 
     ordered = [d for d in domains if d in base]
     if not ordered:
         return {}
 
-    bases = [base[d] for d in ordered]
-    sum_base = sum(bases)
+    def _r(v):
+        return round(v) if is_vnd else round(v, 2)
 
-    target_total = None
+    sum_all = sum(base.values())                     # mọi domain trong giỏ
+    sum_base = sum(base[d] for d in ordered)
+
+    tax = 0.0
     if cart.total is not None and cart.total > 0:
-        target_total = cart.total + (cart.extra_fee or 0.0)
-    elif cart.tax_fees is not None and cart.tax_fees != 0 and sum_base > 0:
-        target_total = sum_base + cart.tax_fees
+        tax = cart.total + (cart.extra_fee or 0.0) - sum_all
+    elif cart.tax_fees is not None and cart.tax_fees > 0:
+        tax = float(cart.tax_fees)
 
-    if target_total is None or sum_base <= 0:
-        return {d: base[d] for d in ordered}
+    if sum_base <= 0 or tax < (0.5 if is_vnd else 0.005):
+        return {d: _r(base[d]) for d in ordered}
 
-    allocated = []
-    for b in bases:
-        share = (b / sum_base) * target_total
-        if is_vnd:
-            allocated.append(round(share))
-        else:
-            allocated.append(round(share, 2))
-
-    current_sum = sum(allocated)
-    diff = target_total - current_sum
-    if is_vnd:
-        allocated[-1] = round(allocated[-1] + diff)
-    else:
-        allocated[-1] = round(allocated[-1] + diff, 2)
-
-    return {d: p for d, p in zip(ordered, allocated)}
+    shares = [round(base[d] / sum_base * tax, nd) for d in ordered]
+    shares[-1] = round(tax - sum(shares[:-1]), nd)
+    return {d: _r(base[d] + sh) for d, sh in zip(ordered, shares)}
 
 PRICE_DIFF_USD = 10.0
 PRICE_DIFF_VND = 260_000.0
@@ -5254,7 +5256,7 @@ def prices_for_report(
         PRICE_DIFF_REPORT_VND,
     )
 
-def compare(groups: List[OrderGroup], cart: CartData) -> Dict:
+def compare(groups: List[OrderGroup], cart: CartData, ignore_banned: bool = False) -> Dict:
     provider = cart.provider
     if provider == "UNKNOWN" and groups:
         provider = groups[0].provider
@@ -5269,7 +5271,11 @@ def compare(groups: List[OrderGroup], cart: CartData) -> Dict:
     matched = [d for d in all_original if d in cart_set]
     missing = [d for d in all_original if d not in cart_set]
     extra = [d for d in cart_set if d not in all_original]
-    banned = [d for d in all_original if is_banned_via_mongo(d, all_original[d]["provider"])]
+    banned_all = [d for d in all_original if is_banned_via_mongo(d, all_original[d]["provider"])]
+    missing_set = set(missing)
+    banned_missing = [d for d in banned_all if d in missing_set]      # cấm + thiếu → vàng
+    banned_cart = [d for d in banned_all if d in cart_set]            # cấm + đang trong giỏ
+    banned = [] if ignore_banned else banned_all                      # "Bỏ qua" → vẫn mua bình thường
 
     final_prices = get_final_prices(cart)
     currency = cart.currency or "USD"
@@ -5308,6 +5314,11 @@ def compare(groups: List[OrderGroup], cart: CartData) -> Dict:
         "missing": missing,
         "extra": extra,
         "banned": banned,
+        "banned_all": banned_all,
+        "banned_missing": banned_missing,
+        "banned_cart": banned_cart,
+        "banned_ignored": bool(ignore_banned and banned_cart),
+        "banned_block": [] if ignore_banned else banned_cart,
         "price_zero": price_zero,
         "price_high": price_high,
         "price_diff": price_diff,
@@ -5379,9 +5390,11 @@ def output_step2_text(result: Dict) -> str:
             errs.append(f"Thừa: {', '.join(extra)}")
         lines.append(f"* Danh sách: {'; '.join(errs)} ❌")
 
-    banned = result.get("banned", [])
+    banned = result.get("banned_all", result.get("banned", []))
     if not banned:
         lines.append("* Đuôi cấm: Không có ✔️")
+    elif result.get("banned_ignored"):
+        lines.append(f"* Đuôi cấm: Phát hiện đuôi cấm: {', '.join(banned)} ⚠️ (đã bỏ qua)")
     else:
         lines.append(f"* Đuôi cấm: Phát hiện đuôi cấm: {', '.join(banned)} ❌")
 
@@ -5439,6 +5452,8 @@ def output_command_1(result: Dict, mention: str, wallet: str = "") -> str:
 
     if cart.total is not None:
         total = cart.total + (cart.extra_fee or 0.0)
+        if allocated and total < sum(allocated.values()) - 0.005:
+            total = sum(allocated.values())
     else:
         total = sum(allocated.values()) if allocated else 0.0
 
@@ -5521,54 +5536,37 @@ def output_lech_gia(result: Dict) -> str:
     allocated = allocate_tax_fees(cart, matched_valid)
     final_prices = result["final_prices"]
 
-    orig_map: Dict[str, DomainItem] = {}
-    group_of: Dict[str, str] = {}
+    def _fmt(v: float, unit: str) -> str:
+        if unit == "VND":
+            return format_vnd(v)
+        if abs(v - round(v)) < 1e-9:
+            return f"{v:g}"
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+
+    # mỗi đơn (mã đơn) của từng SEO là 1 block
+    blocks: List[List[str]] = []
     for g in result["groups"]:
         gname = clean_group_name(g.group_name) or g.group_name or "SEO"
+        rows: List[str] = []
         for d in g.domains:
-            orig_map[d.domain] = d
-            group_of[d.domain] = gname
+            if d.domain not in matched_valid:
+                continue
+            cart_price = allocated.get(d.domain, final_prices.get(d.domain, 0.0))
+            va, vb, unit, thr = prices_for_report(d.price, d.currency or "USD", cart_price, currency)
+            if vb - va > thr:
+                rows.append(f"{d.domain} – Giá đề xuất của SEO: {_fmt(va, unit)} -> Giá thực tế: {_fmt(vb, unit)}")
+        if rows:
+            blocks.append([gname, f"Mã đơn: {g.order_id}"] + rows)
 
-    by_group: "OrderedDict[str, List[Tuple[str, float, float]]]" = OrderedDict()
-    for domain in matched_valid:
-        if domain not in orig_map:
-            continue
-        orig_item = orig_map[domain]
-        orig_price = orig_item.price
-        orig_curr = orig_item.currency or "USD"
-        cart_price = allocated.get(domain, final_prices.get(domain, 0.0))
-
-        va, vb, unit, thr = prices_for_report(
-            orig_price, orig_curr, cart_price, currency
-        )
-        if vb - va > thr:
-            gname = group_of.get(domain, "SEO")
-            if gname not in by_group:
-                by_group[gname] = []
-            by_group[gname].append((domain, va, vb, unit))
-
-    if not by_group:
+    if not blocks:
         unit = "VNĐ" if is_vnd else "USD"
         thr = format_vnd(threshold) if is_vnd else f"{threshold:g}$"
         return f"Không có domain lệch giá > {thr} ({unit})."
 
-    lines: List[str] = []
-    for gname, items in by_group.items():
-        lines.append(gname)
-        for domain, orig_p, cart_p, unit in items:
-            if unit == "VND":
-                lines.append(
-                    f"{domain} - {format_vnd(orig_p)} -> {format_vnd(cart_p)}"
-                )
-            else:
-                def _fmt(v: float) -> str:
-                    if abs(v - round(v)) < 1e-9:
-                        return f"{v:g}"
-                    return f"{v:.2f}".rstrip("0").rstrip(".")
-
-                lines.append(f"{domain} - {_fmt(orig_p)} -> {_fmt(cart_p)}")
+    lines: List[str] = ["Chênh lệch giá", ""]
+    for blk in blocks:
+        lines.extend(blk)
         lines.append("")
-
     lines.append("nhờ TT, TP kiểm tra và duyệt mua giúp em")
     return "\n".join(lines).strip()
 
@@ -5593,8 +5591,58 @@ def build_cart(cart_text: str, groups: List[OrderGroup], fee=0.0) -> CartData:
         cart.extra_fee = parse_fee(fee)
     return cart
 
+PROVIDER_DISPLAY = {
+    "NAMECHEAP": "Namecheap", "GODADDY": "GoDaddy", "DYNADOT": "Dynadot", "SPACESHIP": "Spaceship",
+    "SAV": "SAV", "REGERY": "Regery", "HOSTHONGKONG": "HostHongKong",
+}
+
+def output_banned_block(result: Dict) -> str:
+    """Domain cấm đang nằm trong giỏ → không xuất lệnh đề xuất, yêu cầu xóa khỏi giỏ."""
+    lines = ["XÓA DOMAIN CẤM KHỎI GIỎ HÀNG"]
+    lines += [f"* {d}" for d in result.get("banned_block", [])]
+    return "\n".join(lines)
+
+def step1_banned(groups: List[OrderGroup]) -> List[str]:
+    """Kiểm tra đuôi cấm ngay bước Lọc (theo nhà cung cấp của từng đơn)."""
+    out: List[str] = []
+    for g in groups:
+        for d in g.domains:
+            if d.domain not in out and is_banned_via_mongo(d.domain, g.provider):
+                out.append(d.domain)
+    return out
+
+HISTORY_TTL_SEC = _int_env("CART_HISTORY_TTL", 3600)      # lưu lịch sử đề xuất 1 giờ
+
+def save_cart_history(user, groups, result, command, output, ds_import):
+    """Lưu đề xuất + DS import (Mongo tự xóa sau HISTORY_TTL_SEC giây). Lỗi DB chỉ log, không ảnh hưởng thao tác."""
+    db = get_db()
+    if db is None or not user:
+        return
+    try:
+        order_ids = list(OrderedDict.fromkeys(g.order_id for g in groups))
+        domains = list(OrderedDict.fromkeys(d.domain for g in groups for d in g.domains))
+        seo = list(OrderedDict.fromkeys(clean_group_name(g.group_name) or g.group_name for g in groups))
+        sig = f"{result['provider']}|{','.join(sorted(order_ids))}|{','.join(sorted(domains))}"
+        key = hashlib.sha1(sig.encode("utf-8")).hexdigest()
+        now = _now()
+        fields = {
+            "provider": PROVIDER_DISPLAY.get(result["provider"], result["provider"]),
+            "order_ids": order_ids, "domains": domains, "seo": seo,
+            "ds_import": ds_import or "",
+            "created_at": now, "expires_at": now + timedelta(seconds=HISTORY_TTL_SEC),
+        }
+        update = {"$set": fields}
+        if command == "1":
+            fields["output"] = output
+        else:
+            update["$setOnInsert"] = {"output": ""}
+        db.cart_history.update_one({"user": user, "key": key}, update, upsert=True)
+    except Exception:  # noqa: BLE001
+        log.exception("Không lưu được lịch sử cart checker")
+
 def process(
-    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003", fee=0.0, wallet: str = ""
+    original_text: str, cart_text: str, command: str, mention: str = "@Pii_S8_003", fee=0.0, wallet: str = "",
+    ignore_banned: bool = False,
 ) -> str:
     groups = parse_original_list(original_text)
     if command == "step1":
@@ -5604,8 +5652,10 @@ def process(
     if not groups or not cart.items:
         return "Thiếu dữ liệu để xử lý."
 
-    result = compare(groups, cart)
+    result = compare(groups, cart, ignore_banned)
 
+    if command in ("1", "2") and result["banned_block"]:
+        return output_banned_block(result)
     if command == "step2":
         return output_step2_text(result)
     if command == "1":
@@ -5617,12 +5667,12 @@ def process(
 
     return ""
 
-def result_summary(original_text: str, cart_text: str, fee=0.0) -> Optional[Dict]:
+def result_summary(original_text: str, cart_text: str, fee=0.0, ignore_banned: bool = False) -> Optional[Dict]:
     groups = parse_original_list(original_text)
     cart = build_cart(cart_text, groups, fee)
     if not groups or not cart.items:
         return None
-    r = compare(groups, cart)
+    r = compare(groups, cart, ignore_banned)
     display = {
         "NAMECHEAP": "Namecheap",
         "GODADDY": "GoDaddy",
@@ -5659,12 +5709,15 @@ def result_summary(original_text: str, cart_text: str, fee=0.0) -> Optional[Dict
         "matched": r["matched"],
         "missing": r["missing"],
         "extra": r["extra"],
-        "banned": r["banned"],
+        "banned": r["banned_all"],
+        "banned_missing": r["banned_missing"],
+        "banned_cart": r["banned_cart"],
+        "banned_ignored": r["banned_ignored"],
         "price_zero": r.get("price_zero", []),
         "price_high": r.get("price_high", []),
         "price_diff": price_diff_fmt,
         "list_ok": not r["missing"] and not r["extra"],
-        "banned_ok": not r["banned"],
+        "banned_ok": not r["banned_all"],
         "warn_ok": not (
             r.get("price_zero")
             or r.get("price_high")
@@ -5981,6 +6034,39 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
     z-index: 200;
   }
   .toast.show { opacity: 1; }
+  .chip.yellow { background: #fef3c7; color: #b45309; }
+  .chip.yellow:hover { background: #fde68a; }
+  .btn-ignore {
+    display: inline-flex; align-items: center; margin-left: 6px; padding: 3px 12px;
+    font-size: .78rem; font-weight: 700; color: #fff; background: #ea580c;
+    border: 0; border-radius: 6px; cursor: pointer; vertical-align: middle;
+  }
+  .btn-ignore:hover { background: #c2410c; }
+  .modal-back {
+    position: fixed; inset: 0; background: rgba(15,23,42,.55); z-index: 300;
+    display: none; align-items: flex-start; justify-content: center; padding: 4vh 16px;
+  }
+  .modal-back.show { display: flex; }
+  .modal {
+    background: var(--card); border-radius: var(--radius); box-shadow: 0 10px 40px rgba(0,0,0,.3);
+    width: min(1100px, 100%); max-height: 92vh; display: flex; flex-direction: column;
+  }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .modal-head h3 { margin: 0; font-size: 1.05rem; white-space: nowrap; }
+  .modal-head input { flex: 1; }
+  .modal-x { border: 0; background: transparent; font-size: 1.3rem; cursor: pointer; color: var(--muted); }
+  .modal-body { padding: 12px 16px 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+  .h-empty { text-align: center; color: var(--muted); padding: 30px 0; }
+  .h-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .h-meta { font-size: .85rem; color: var(--muted); margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+  .h-meta b { color: var(--text); }
+  .h-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .h-col-head { display: flex; align-items: center; justify-content: space-between; font-size: .82rem; font-weight: 700; margin-bottom: 4px; }
+  .h-col textarea {
+    width: 100%; height: 170px; resize: vertical; border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px; font-family: Consolas, "Cascadia Code", monospace; font-size: .84rem; line-height: 1.4;
+  }
+  @media (max-width: 900px) { .h-cols { grid-template-columns: 1fr; } }
   @media (max-width: 900px) {
     .app { grid-template-columns: 1fr; }
     .sidebar { flex-direction: row; flex-wrap: wrap; padding: 8px 12px; }
@@ -6013,6 +6099,7 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
              value="TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
       <button class="btn btn-violet" data-cmd="step1">🔍 Lọc</button>
       <button class="btn btn-green" data-cmd="1">💡 Đề xuất</button>
+      <button class="btn btn-slate" id="btnHistory" title="Xem lại các đơn đã đề xuất trong 1 giờ qua">🕘 Lịch sử</button>
       <button class="btn btn-red" id="btnClear">🗑️ Xóa tất cả</button>
     </div>
   </aside>
@@ -6070,6 +6157,17 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
   <footer id="status">Sẵn sàng · Hotkey: <b>1</b> = Đề xuất · <b>2</b> = DS import · <b>Esc×3</b> = Xóa tất cả</footer>
 </div>
 
+<div class="modal-back" id="historyModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="Lịch sử đề xuất">
+    <div class="modal-head">
+      <h3>🕘 Lịch sử (1 giờ qua)</h3>
+      <input type="text" id="hSearch" placeholder="Tìm domain hoặc mã đơn (DM-…)" autocomplete="off" spellcheck="false" />
+      <button class="modal-x" id="hClose" title="Đóng">✕</button>
+    </div>
+    <div class="modal-body" id="hList"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -6096,6 +6194,10 @@ $("#original").addEventListener("input", syncFeeBox);
 function getFee() {
   return isRegery() ? ($("#regeryFee").value || "").trim() : "";
 }
+
+let ignoreBanned = false;   // bấm "Bỏ qua" → vẫn mua domain cấm trong giỏ
+$("#cart").addEventListener("input", () => { ignoreBanned = false; });
+$("#original").addEventListener("input", () => { ignoreBanned = false; });
 
 const DEFAULT_WALLET = "TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k";
 const WALLET_KEY = "cart_checker_trc20_wallet";
@@ -6140,10 +6242,10 @@ $("#mentionSelect").addEventListener("change", () => {
   }
 });
 
-function chipHtml(domains) {
+function chipHtml(domains, clsFn) {
   if (!domains || !domains.length) return "";
   return `<div class="chips">${domains.map(d =>
-    `<span class="chip" data-d="${escapeAttr(d)}">${escapeHtml(d)}</span>`
+    `<span class="chip ${clsFn ? clsFn(d) : ""}" data-d="${escapeAttr(d)}">${escapeHtml(d)}</span>`
   ).join("")}</div>`;
 }
 
@@ -6193,13 +6295,14 @@ function renderSummary(s) {
     return;
   }
   setInlineIcon("provValue", "provIcon", s.provider || "—", "✔", "ok");
+  const bmSet = new Set(s.banned_missing || []);
 
   if (s.list_ok) {
     setInlineIcon("listValue", "listIcon", "Khớp hoàn toàn", "✔", "ok");
   } else {
     let html = "";
     if (s.missing && s.missing.length) {
-      html += `<span style="margin-right:4px">Thiếu:</span>${chipHtml(s.missing)}`;
+      html += `<span style="margin-right:4px">Thiếu:</span>${chipHtml(s.missing, d => bmSet.has(d) ? "yellow" : "")}`;
       if (s.missing.length > 1) {
         html += ` <button type="button" class="btn-copy-missing" id="btnCopyMissing" title="Copy tất cả domain thiếu (mỗi domain 1 dòng)">📋 Copy thiếu</button>`;
       }
@@ -6230,8 +6333,20 @@ function renderSummary(s) {
   if (s.banned_ok) {
     setInlineIcon("bannedValue", "bannedIcon", "Không có", "✔", "ok");
   } else {
-    $("#bannedValue").innerHTML = `<span style="margin-right:4px">Phát hiện:</span>${chipHtml(s.banned)} <span class="icon err" id="bannedIcon">✘</span>`;
+    const inCart = new Set(s.banned_cart || []);
+    const blocking = inCart.size > 0 && !s.banned_ignored;
+    const cls = d => (s.banned_ignored || !inCart.has(d)) ? "yellow" : "";
+    let bh = `<span style="margin-right:4px">Phát hiện:</span>${chipHtml(s.banned, cls)}`;
+    if (blocking) {
+      bh += ` <button type="button" class="btn-ignore" id="btnIgnoreBanned" title="Bỏ qua và vẫn mua domain cấm">Bỏ qua</button> <span class="icon err" id="bannedIcon">✘</span>`;
+    } else {
+      bh += ` <span class="icon warn" id="bannedIcon">⚠</span>`;
+      if (s.banned_ignored) bh += ` <span style="color:var(--warn);font-size:.8rem;font-weight:600">(đã bỏ qua – vẫn mua)</span>`;
+    }
+    $("#bannedValue").innerHTML = bh;
     bindChips($("#bannedValue"));
+    const btnIgn = $("#btnIgnoreBanned");
+    if (btnIgn) btnIgn.addEventListener("click", () => { ignoreBanned = true; run("1"); });
   }
 
   const msgs = [];
@@ -6264,6 +6379,18 @@ function renderSummary(s) {
   } else {
     setInlineIcon("warnValue", "warnIcon", "Không có", "✔", "ok");
     $("#warnLine").textContent = "";
+  }
+}
+
+function renderStep1(providerName, banned) {
+  resetCheckPanel();
+  setInlineIcon("provValue", "provIcon", providerName || "—", "✔", "ok");
+  if (banned && banned.length) {
+    $("#bannedValue").innerHTML = `<span style="margin-right:4px">Phát hiện:</span>${chipHtml(banned)} <span class="icon err" id="bannedIcon">✘</span>`;
+    bindChips($("#bannedValue"));
+    toast("Phát hiện " + banned.length + " domain cấm");
+  } else {
+    setInlineIcon("bannedValue", "bannedIcon", "Không có", "✔", "ok");
   }
 }
 
@@ -6313,6 +6440,7 @@ async function run(cmd) {
         mention: getMention(),
         fee: getFee(),
         wallet: getWallet(),
+        ignore_banned: ignoreBanned,
       }),
     });
     const data = await res.json();
@@ -6323,7 +6451,7 @@ async function run(cmd) {
     }
     $("#result").value = data.result || "";
     if (data.summary) renderSummary(data.summary);
-    else if (cmd === "step1") resetCheckPanel();
+    else if (cmd === "step1") renderStep1(data.provider_display, data.banned || []);
 
     if (cmd === "step1") {
       updateBeastButton(data.provider || "", data.domains || []);
@@ -6361,6 +6489,7 @@ $$("[data-cmd]").forEach(btn => {
 });
 
 function clearAll() {
+  ignoreBanned = false;
   $("#original").value = "";
   $("#cart").value = "";
   $("#result").value = "";
@@ -6428,6 +6557,85 @@ $("#btnBeast").addEventListener("click", () => {
   }
 });
 
+// ---------- Lịch sử ----------
+let historyItems = [];
+function historyOpen() { return $("#historyModal").classList.contains("show"); }
+function closeHistory() { $("#historyModal").classList.remove("show"); }
+
+async function copyText(text, okMsg) {
+  try { await navigator.clipboard.writeText(text); toast(okMsg || "Đã copy ✓"); }
+  catch (e) { toast("Không copy được"); }
+}
+
+function renderHistory() {
+  const q = ($("#hSearch").value || "").trim().toLowerCase();
+  const list = $("#hList");
+  list.textContent = "";
+  const items = historyItems.filter(it => !q
+    || (it.domains || []).some(d => d.toLowerCase().includes(q))
+    || (it.order_ids || []).some(o => o.toLowerCase().includes(q)));
+  if (!items.length) {
+    const e = document.createElement("div");
+    e.className = "h-empty";
+    e.textContent = historyItems.length ? "Không tìm thấy kết quả phù hợp" : "Chưa có đơn nào được đề xuất trong 1 giờ qua";
+    list.appendChild(e);
+    return;
+  }
+  const mk = (tag, cls, text) => { const el = document.createElement(tag); if (cls) el.className = cls; if (text != null) el.textContent = text; return el; };
+  items.forEach(it => {
+    const card = mk("div", "h-card");
+    const meta = mk("div", "h-meta");
+    const t = new Date(it.created_at);
+    const left = Math.max(0, Math.round((new Date(it.expires_at) - Date.now()) / 60000));
+    const m1 = mk("span"); m1.append("🕒 ", mk("b", "", t.toLocaleTimeString("vi-VN")), ` · còn ${left} phút`);
+    const m2 = mk("span"); m2.append("NCC: ", mk("b", "", it.provider || "—"));
+    const m3 = mk("span"); m3.append("Mã đơn: ", mk("b", "", (it.order_ids || []).join(", ")));
+    const m4 = mk("span"); m4.append("Domain: ", mk("b", "", (it.domains || []).join(", ")));
+    meta.append(m1, m2, m3, m4);
+    card.appendChild(meta);
+
+    const cols = mk("div", "h-cols");
+    [["💡 Đề xuất", it.output], ["📥 DS import (Smart Note)", it.ds_import]].forEach(([label, val]) => {
+      const col = mk("div", "h-col");
+      const head = mk("div", "h-col-head");
+      head.appendChild(mk("span", "", label));
+      const btn = mk("button", "btn btn-sm btn-sky", "📋 Copy");
+      btn.type = "button";
+      btn.addEventListener("click", () => {
+        if (!(val || "").trim()) { toast("Phần này trống"); return; }
+        copyText(val, "Đã copy: " + label);
+      });
+      head.appendChild(btn);
+      const ta = mk("textarea");
+      ta.readOnly = true; ta.spellcheck = false; ta.value = val || "";
+      col.append(head, ta);
+      cols.appendChild(col);
+    });
+    card.appendChild(cols);
+    list.appendChild(card);
+  });
+}
+
+async function openHistory() {
+  $("#historyModal").classList.add("show");
+  $("#hSearch").value = "";
+  $("#hList").textContent = "Đang tải…";
+  try {
+    const res = await fetch("/api/cart-checker/history", { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok || data.error) { $("#hList").textContent = data.error || "Không tải được lịch sử"; return; }
+    historyItems = data.items || [];
+    renderHistory();
+    $("#hSearch").focus();
+  } catch (e) {
+    $("#hList").textContent = "Lỗi kết nối server";
+  }
+}
+$("#btnHistory").addEventListener("click", openHistory);
+$("#hClose").addEventListener("click", closeHistory);
+$("#historyModal").addEventListener("click", (e) => { if (e.target.id === "historyModal") closeHistory(); });
+$("#hSearch").addEventListener("input", renderHistory);
+
 function isTyping() {
   const el = document.activeElement;
   return el && (el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.isContentEditable);
@@ -6435,6 +6643,10 @@ function isTyping() {
 let escCount = 0;
 let escTimer = null;
 document.addEventListener("keydown", (e) => {
+  if (historyOpen()) {                 // popup lịch sử đang mở: Esc chỉ đóng popup, không tính Esc×3
+    if (e.key === "Escape") closeHistory();
+    return;
+  }
   if (e.key === "Escape") {
     escCount += 1;
     if (escTimer) clearTimeout(escTimer);
@@ -6464,45 +6676,83 @@ def cart_checker():
 @app.route("/api/cart-checker/run", methods=["POST"])
 @login_required
 def api_cart_checker_run():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     original = str(data.get("original") or "")
     cart = str(data.get("cart") or "")
     command = str(data.get("command") or "")
     mention = str(data.get("mention") or "@Pii_S8_003")
     fee = data.get("fee")
     wallet = clean_wallet(data.get("wallet"))
+    ignore_banned = bool(data.get("ignore_banned"))
 
     if command not in ("step1", "step2", "1", "2", "lechgia"):
         return jsonify(error="Lệnh không hợp lệ"), 400
     try:
-        text = process(original, cart, command, mention, fee, wallet)
+        text = process(original, cart, command, mention, fee, wallet, ignore_banned)
         summary = None
         provider = None
+        provider_display = None
         domains = None
+        banned = None
         ds_import = None
         if command == "step1":
             groups = parse_original_list(original)
             if groups:
                 provider = groups[0].provider
+                provider_display = PROVIDER_DISPLAY.get(provider, provider)
                 domains = [d.domain for g in groups for d in g.domains]
+                banned = step1_banned(groups)          # kiểm tra đuôi cấm ngay ở bước Lọc
         else:
-            summary = result_summary(original, cart, fee)
+            summary = result_summary(original, cart, fee, ignore_banned)
             if command in ("1", "2"):
                 groups = parse_original_list(original)
                 cart_obj = build_cart(cart, groups, fee)
                 if groups and cart_obj.items:
-                    result_obj = compare(groups, cart_obj)
-                    ds_import = output_command_2(result_obj)
+                    result_obj = compare(groups, cart_obj, ignore_banned)
+                    if not result_obj["banned_block"]:   # bị chặn vì domain cấm → không có đề xuất để lưu/gửi
+                        ds_import = output_command_2(result_obj)
+                        save_cart_history(session.get("user"), groups, result_obj, command, text, ds_import)
         return jsonify({
             "result": text,
             "summary": summary,
             "provider": provider,
+            "provider_display": provider_display,
             "domains": domains,
+            "banned": banned,
             "ds_import": ds_import,
         })
     except Exception as e:
         log.exception("Error in cart checker run API")
         return jsonify(error=str(e)), 500
+
+
+@app.route("/api/cart-checker/history", methods=["GET"])
+@login_required
+def api_cart_checker_history():
+    db = get_db()
+    if db is None:
+        return jsonify(error="Chưa kết nối được database"), 503
+    try:
+        now = _now()
+        cur = (db.cart_history.find({"user": session.get("user"), "expires_at": {"$gt": now}})
+               .sort("created_at", -1).limit(200))
+        items = [{
+            "id": str(d["_id"]),
+            "provider": d.get("provider", ""),
+            "order_ids": d.get("order_ids", []),
+            "domains": d.get("domains", []),
+            "seo": d.get("seo", []),
+            "output": d.get("output", ""),
+            "ds_import": d.get("ds_import", ""),
+            "created_at": _iso(d.get("created_at")),
+            "expires_at": _iso(d.get("expires_at")),
+        } for d in cur]
+    except PyMongoError:
+        log.exception("Đọc lịch sử cart checker lỗi")
+        return jsonify(error="Không đọc được lịch sử"), 500
+    resp = jsonify(items=items)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 if __name__ == "__main__":
