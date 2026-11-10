@@ -1478,21 +1478,150 @@ def check_transfer_eligibility(domain):
 # 2c. GIÁ DOMAIN MUA MỚI (1 NĂM) TỪ GODADDY API v3
 # ==========================================
 GD_CHECK_URL = "https://api.godaddy.com/v3/domains/check-availability"
-_gd_lock = threading.Lock()
-_gd_last_call = 0.0
-_gd_block_until = 0.0            # sau khi bị 429: tạm dừng gọi đến mốc này (monotonic)
 _gd_cache = {}
 _gd_cache_lock = threading.Lock()
 
+# ---- Trạng thái giới hạn tốc độ theo TỪNG token (token hệ thống và mỗi token cá nhân tính riêng) ----
+_gd_tok_state = {}               # sha256(token)[:16] -> {"lock", "last", "block"}
+_gd_tok_state_lock = threading.Lock()
 
-def _gd_throttle():
-    """Giãn cách các lần gọi GoDaddy giữa mọi thread (giới hạn 60 req/phút/token)."""
-    global _gd_last_call
-    with _gd_lock:
-        wait = GODADDY_MIN_INTERVAL - (time.monotonic() - _gd_last_call)
+
+def _gd_tok_key(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _gd_state_for(token):
+    key = _gd_tok_key(token)
+    with _gd_tok_state_lock:
+        st = _gd_tok_state.get(key)
+        if st is None:
+            if len(_gd_tok_state) > 2000:
+                _gd_tok_state.clear()
+            st = _gd_tok_state[key] = {"lock": threading.Lock(), "last": 0.0, "block": 0.0}
+        return st
+
+
+def _gd_throttle(st):
+    """Giãn cách các lần gọi GoDaddy của CÙNG 1 token giữa mọi thread (giới hạn 60 req/phút/token)."""
+    with st["lock"]:
+        wait = GODADDY_MIN_INTERVAL - (time.monotonic() - st["last"])
         if wait > 0:
             time.sleep(wait)
-        _gd_last_call = time.monotonic()
+        st["last"] = time.monotonic()
+
+
+# ---- Token API GoDaddy: hệ thống (admin xem/sửa trên giao diện) + cá nhân (lưu theo tài khoản) ----
+_GD_SYS_ID = "gd_system_token"            # app_settings: token hệ thống do admin đặt (ghi đè biến môi trường)
+_GD_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{16,2000}$")
+GD_TOKEN_TTL = 10
+_gd_sys_cache = {"ts": -1e9, "val": ""}
+_gd_pref_cache = {}                       # username -> (ts, mode, token)
+_gd_pref_lock = threading.Lock()
+
+
+def _gd_clean_token(raw):
+    """Chuẩn hóa token người dùng dán vào: bỏ khoảng trắng, dấu nháy, tiền tố 'Bearer '.
+    Trả về (token, lỗi)."""
+    t = str(raw or "").strip().strip("'\"`").strip()
+    if t.lower().startswith("bearer "):
+        t = t[7:].strip()
+    if not t:
+        return "", "Chưa nhập token"
+    if ":" in t:
+        return "", ("Đây là cặp Key:Secret kiểu cũ — API mới cần Personal Access Token "
+                    "(tạo ở developer.godaddy.com/personal-access-token)")
+    if not _GD_TOKEN_RE.match(t):
+        return "", "Token không hợp lệ (16–2000 ký tự, không chứa khoảng trắng hay ký tự lạ)"
+    return t, None
+
+
+def _gd_mask(token):
+    return ("•••• " + token[-4:]) if token else ""
+
+
+def get_gd_system_token(force=False):
+    """Token hệ thống: giá trị admin lưu trong MongoDB nếu có, không thì biến môi trường GODADDY_PAT.
+    Trả về (token, nguồn) — nguồn: 'db' | 'env' | 'none'."""
+    now = time.monotonic()
+    with _gd_pref_lock:
+        if not force and now - _gd_sys_cache["ts"] < GD_TOKEN_TTL:
+            val = _gd_sys_cache["val"]
+            return (val, "db") if val else ((GODADDY_PAT, "env") if GODADDY_PAT else ("", "none"))
+    val = ""
+    db = get_db()
+    if db is not None:
+        try:
+            doc = db.app_settings.find_one({"_id": _GD_SYS_ID}) or {}
+            val = str(doc.get("token") or "").strip()
+        except PyMongoError as e:
+            log.error("Lỗi đọc token GoDaddy hệ thống từ MongoDB: %s", e)
+            with _gd_pref_lock:                     # lỗi DB: giữ giá trị cache cũ
+                val = _gd_sys_cache["val"]
+    with _gd_pref_lock:
+        _gd_sys_cache.update(ts=now, val=val)
+    return (val, "db") if val else ((GODADDY_PAT, "env") if GODADDY_PAT else ("", "none"))
+
+
+def get_gd_user_pref(username, force=False):
+    """Lựa chọn token của 1 tài khoản → (mode, token). mode: 'system' | 'personal'."""
+    now = time.monotonic()
+    key = (username or "").lower()
+    with _gd_pref_lock:
+        hit = _gd_pref_cache.get(key)
+        if hit and not force and now - hit[0] < GD_TOKEN_TTL:
+            return hit[1], hit[2]
+    mode, token = "system", ""
+    db = get_db()
+    if db is not None:
+        try:
+            doc = db.users.find_one({"username_lower": key}, {"gd_mode": 1, "gd_token": 1}) or {}
+            token = str(doc.get("gd_token") or "").strip()
+            mode = "personal" if (doc.get("gd_mode") == "personal" and token) else "system"
+        except PyMongoError as e:
+            log.error("Lỗi đọc token GoDaddy cá nhân của %s: %s", username, e)
+    with _gd_pref_lock:
+        if len(_gd_pref_cache) > 5000:
+            _gd_pref_cache.clear()
+        _gd_pref_cache[key] = (now, mode, token)
+    return mode, token
+
+
+def _invalidate_gd_token_cache():
+    with _gd_pref_lock:
+        _gd_sys_cache["ts"] = -1e9
+        _gd_pref_cache.clear()
+
+
+def resolve_gd_token(username):
+    """Token dùng cho 1 request của tài khoản → (token, mode). Admin luôn dùng token hệ thống.
+    Mặc định (chưa chọn gì) = token hệ thống."""
+    if username and username != ADMIN_USERNAME:
+        mode, token = get_gd_user_pref(username)
+        if mode == "personal" and token:
+            return token, "personal"
+    return get_gd_system_token()[0], "system"
+
+
+def gd_test_token(token):
+    """Gọi thử GoDaddy bằng token để báo lỗi sớm khi lưu → (verdict, thông báo).
+    verdict: 'ok' (dùng được) | 'invalid' (sai / thiếu quyền → không lưu) | 'unknown' (chưa xác minh được → vẫn lưu)."""
+    st = _gd_state_for(token)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
+               "User-Agent": HTTP_HEADERS["User-Agent"]}
+    try:
+        _gd_throttle(st)
+        r = requests.get(GD_CHECK_URL, headers=headers, params={"domain": "example.com"}, timeout=(5, 12))
+    except requests.RequestException:
+        return "unknown", "Chưa kiểm tra thử được với GoDaddy (lỗi mạng) — token vẫn được lưu"
+    if r.status_code == 200:
+        return "ok", "Token hoạt động"
+    if r.status_code == 401:
+        return "invalid", "GoDaddy báo token sai, đã hết hạn hoặc bị thu hồi — hãy tạo token mới"
+    if r.status_code == 403:
+        return "invalid", "Token thiếu quyền domains.domain:read (hoặc tài khoản chưa đủ điều kiện dùng API)"
+    if r.status_code == 429:
+        return "ok", "Token hợp lệ (đang bị giới hạn tốc độ tạm thời)"
+    return "unknown", f"GoDaddy trả HTTP {r.status_code} — chưa xác minh được, token vẫn được lưu"
 
 
 def _gd_result(state, html_, failed=False, **extra):
@@ -1649,11 +1778,13 @@ def gd_fixed_price_for(domain):
     return None
 
 
-def check_godaddy_price(domain):
+def check_godaddy_price(domain, token=None, token_mode="system"):
     """Gọi GoDaddy để xác nhận domain còn đăng ký được; nếu đuôi có giá cố định (admin set)
     thì thay giá bằng giá cố định. Domain không khả dụng / lỗi API / premium → giữ nguyên kết quả GoDaddy.
     Kết quả GoDaddy được cache thô, giá cố định áp lúc trả về nên admin sửa là có hiệu lực ngay."""
-    out = _check_godaddy_price_raw(domain)
+    if token is None:
+        token = get_gd_system_token()[0]
+    out = _check_godaddy_price_raw(domain, token, token_mode)
     if out.get("state") in ("ok", "noprice") and not out.get("failed") and not out.get("premium"):
         fixed = gd_fixed_price_for(domain)
         if fixed is not None:
@@ -1661,24 +1792,26 @@ def check_godaddy_price(domain):
     return out
 
 
-def _check_godaddy_price_raw(domain):
-    """Giá đăng ký mới 1 năm trên GoDaddy (API v3, chỉ đọc) + VAT + quy đổi VNĐ."""
-    global _gd_block_until
-    if not GODADDY_PAT:
-        return _gd_result("nokey", _badge("badge-muted", "Thiếu API GoDaddy"))
+def _check_godaddy_price_raw(domain, token, token_mode="system"):
+    """Giá đăng ký mới 1 năm trên GoDaddy (API v3, chỉ đọc) + VAT + quy đổi VNĐ.
+    token = token hệ thống hoặc token cá nhân của người dùng; giới hạn tốc độ tính riêng từng token."""
+    personal = token_mode == "personal"
+    if not token:
+        return _gd_result("nokey", _badge("badge-muted", "Thiếu API GoDaddy"), failed=True)
+    st = _gd_state_for(token)
 
     now = time.monotonic()
     with _gd_cache_lock:
         hit = _gd_cache.get(domain)
         if hit and hit[0] > now:
             return dict(hit[1])
-    if _gd_block_until > now:
+    if st["block"] > now:
         return _gd_result("ratelimit", _badge("badge-warning", "GoDaddy giới hạn tốc độ — thử lại sau"), failed=True)
 
-    headers = {"Authorization": f"Bearer {GODADDY_PAT}", "Accept": "application/json",
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json",
                "User-Agent": HTTP_HEADERS["User-Agent"]}
     try:
-        _gd_throttle()
+        _gd_throttle(st)
         r = requests.get(GD_CHECK_URL, headers=headers, params={"domain": domain}, timeout=(5, 12))
     except requests.RequestException as e:
         log.warning("GoDaddy lỗi %s: %s", domain, type(e).__name__)
@@ -1689,14 +1822,15 @@ def _check_godaddy_price_raw(domain):
             wait = min(max(int(r.headers.get("Retry-After", "30")), 1), 120)
         except ValueError:
             wait = 30
-        _gd_block_until = time.monotonic() + wait
-        log.warning("GoDaddy 429 — tạm dừng %ss", wait)
+        st["block"] = time.monotonic() + wait
+        log.warning("GoDaddy 429 (%s) — tạm dừng %ss", token_mode, wait)
         return _gd_result("ratelimit", _badge("badge-warning", "GoDaddy giới hạn tốc độ — thử lại sau"), failed=True)
     if r.status_code == 401:
-        log.error("GoDaddy 401: GODADDY_PAT sai hoặc đã hết hạn / bị thu hồi")
-        return _gd_result("auth", _badge("badge-danger", "Token GoDaddy không hợp lệ"), failed=True)
+        log.error("GoDaddy 401: token %s sai hoặc đã hết hạn / bị thu hồi", token_mode)
+        return _gd_result("auth", _badge("badge-danger", "Token cá nhân không hợp lệ" if personal
+                                         else "Token GoDaddy không hợp lệ"), failed=True)
     if r.status_code == 403:
-        log.error("GoDaddy 403: token thiếu scope domains.domain:read hoặc tài khoản chưa đủ điều kiện")
+        log.error("GoDaddy 403 (%s): token thiếu scope domains.domain:read hoặc tài khoản chưa đủ điều kiện", token_mode)
         return _gd_result("auth", _badge("badge-danger", "Token thiếu quyền / tài khoản chưa đủ điều kiện"), failed=True)
     if r.status_code == 400:
         return _gd_result("invalid", _badge("badge-muted", "GoDaddy từ chối domain này"))
@@ -2301,6 +2435,39 @@ HTML_TEMPLATE = """
             .notice-overlay, .notice-overlay.show, .notice-dialog { transition: none; }
         }
 
+        /* ===== Token API GoDaddy (popup + hướng dẫn) ===== */
+        .modal-content.gd-modal { width: 640px; max-height: 92vh; overflow-y: auto; scrollbar-width: thin; }
+        .gd-alert {
+            background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.3); color: #fbbf24;
+            padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.55; margin-bottom: 14px;
+        }
+        .gd-opt {
+            display: flex; gap: 10px; align-items: flex-start; padding: 11px 12px; margin-bottom: 8px; cursor: pointer;
+            border: 1px solid var(--border-light); border-radius: 10px; font-size: 14px;
+        }
+        .gd-opt:has(input:checked) { border-color: var(--primary); background: rgba(59, 130, 246, 0.1); }
+        .gd-opt input { margin-top: 3px; width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; }
+        .gd-opt small { display: block; color: var(--text-dim); font-size: 12px; line-height: 1.5; margin-top: 2px; }
+        .gd-actions { display: flex; gap: 8px; margin-top: 14px; }
+        .gd-actions .btn-primary { flex: 1; justify-content: center; }
+        .gd-steps {
+            background: var(--bg); border: 1px solid var(--border-light); border-radius: 10px;
+            padding: 12px 14px; margin-top: 14px; font-size: 13px; line-height: 1.6;
+        }
+        .gd-steps > summary { cursor: pointer; font-weight: 700; font-size: 13.5px; }
+        .gd-steps ol { margin: 10px 0 0 18px; padding: 0; }
+        .gd-steps li { margin-bottom: 8px; color: var(--text-muted); }
+        .gd-steps li b, .gd-steps li code { color: var(--text); }
+        .gd-steps code {
+            font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-elevated);
+            padding: 1px 6px; border-radius: 5px;
+        }
+        .gd-steps a { color: #93c5fd; }
+        .gd-steps .gd-note { margin-top: 10px; font-size: 12px; color: var(--text-dim); }
+        .gd-token-bar {
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px;
+            font-size: 13px; color: var(--text-muted);
+        }
 {% if is_admin %}
         /* ===== Admin: toast + các tab quản trị mới ===== */
         .toast-box {
@@ -2361,6 +2528,7 @@ HTML_TEMPLATE = """
             <button class="tab-btn" data-tab="rules">⚙ Đuôi cấm / cho phép</button>
             <button class="tab-btn" data-tab="checkopts">☑ Cài đặt kiểm tra</button>
             <button class="tab-btn" data-tab="gdfixed">💰 Giá cố định GoDaddy</button>
+            <button class="tab-btn" data-tab="gdtoken">🔑 API GoDaddy</button>
             <button class="tab-btn" data-tab="blocks">🚫 Domain cấm (ẩn)</button>
             <button class="tab-btn" data-tab="keywords">🔤 Cấm Keyword</button>
             <button class="tab-btn" data-tab="notices">📢 Thông báo</button>
@@ -2550,6 +2718,27 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+{% macro gd_steps() %}
+        <details class="gd-steps" open>
+            <summary>📘 Cách tạo API token GoDaddy (khoảng 2 phút, miễn phí)</summary>
+            <ol>
+                <li>Mở <a href="https://developer.godaddy.com/personal-access-token" target="_blank" rel="noopener noreferrer">developer.godaddy.com/personal-access-token</a> và đăng nhập bằng tài khoản GoDaddy.
+                    Chưa có tài khoản thì tạo miễn phí tại <a href="https://sso.godaddy.com" target="_blank" rel="noopener noreferrer">sso.godaddy.com</a>, xác nhận email rồi quay lại trang này.</li>
+                <li>Bấm nút <b>+ Generate Token</b>.</li>
+                <li>Ở phần chọn quyền (scope), chỉ cần tick <code>domains.domain:read</code> (quyền đọc: kiểm tra domain và giá).
+                    Nếu thấy nhóm <b>Domains &amp; DNS</b> thì mở rộng ra và chọn riêng mục đọc — <b>không</b> cần cấp quyền tạo / sửa / xóa domain.</li>
+                <li>Bấm tạo (Generate), hộp thoại <b>Copy your new token</b> hiện ra → bấm biểu tượng copy.
+                    <b>Token chỉ hiện đúng 1 lần</b>, đóng hộp thoại là không xem lại được (lỡ mất thì tạo token mới).</li>
+                <li>Dán token vào ô <b>Personal Access Token</b> ở trên rồi bấm <b>Lưu</b>. Hệ thống sẽ gọi thử GoDaddy để xác nhận token dùng được.</li>
+            </ol>
+            <div class="gd-note">
+                Mỗi token được GoDaddy cho tối đa khoảng 60 lượt kiểm tra mỗi phút, nên token cá nhân của bạn không bị ảnh hưởng bởi người khác.
+                Cần dán đúng <b>Personal Access Token</b>, không phải cặp Key / Secret kiểu cũ. Token chỉ có quyền đọc nên không thể mua hay sửa domain.
+                Gặp lỗi 401 nghĩa là token sai hoặc đã bị thu hồi; lỗi 403 nghĩa là token thiếu quyền <code>domains.domain:read</code>.
+            </div>
+        </details>
+{% endmacro %}
+
         <!-- ================= TAB: KIỂM TRA GIÁ GODADDY (API) ================= -->
         <div class="tab-panel" id="tab-price">
             <div class="note-box">
@@ -2572,6 +2761,15 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
                 <div class="progress" id="gdProgress">Sẵn sàng kiểm tra</div>
+                <div class="gd-token-bar">
+{% if is_admin %}
+                    <span>🔑 Đang dùng token hệ thống</span>
+                    <button type="button" class="btn-secondary" onclick="showTab('gdtoken')">Xem / đổi token</button>
+{% else %}
+                    <span id="gdTokenStatus">🔑 Đang dùng token hệ thống</span>
+                    <button type="button" class="btn-secondary" onclick="openGdToken('', false)">🔑 API Token</button>
+{% endif %}
+                </div>
             </div>
             <div class="table-card">
                 <div class="table-wrapper">
@@ -2649,6 +2847,40 @@ HTML_TEMPLATE = """
                     <button class="btn-secondary" id="btnGfReload" type="button">↻ Tải lại</button>
                     <span class="msg" id="gfMsg"></span>
                 </div>
+            </div>
+        </div>
+
+        <!-- ================= TAB (ADMIN): TOKEN API GODADDY ================= -->
+        <div class="tab-panel" id="tab-gdtoken">
+            <div class="note-box">
+                <span class="note-icon">🔑</span>
+                <div>
+                    <strong>Token API GoDaddy dùng chung của hệ thống.</strong>
+                    Mọi tài khoản mặc định dùng token này cho tab "Kiểm tra giá mua mới GoDaddy". Khi GoDaddy báo giới hạn tốc độ hoặc token lỗi,
+                    người dùng sẽ được mở popup để nhập token cá nhân (lưu vĩnh viễn theo tài khoản của họ).
+                    Giá trị lưu ở đây <b>ghi đè</b> biến môi trường <code>GODADDY_PAT</code> và có hiệu lực ngay, không cần khởi động lại.
+                </div>
+            </div>
+            <div class="card">
+                <div class="section-title">Token hệ thống</div>
+                <div class="form-group">
+                    <label for="gtInput">Personal Access Token</label>
+                    <div class="inline-row">
+                        <input class="field field-mono" id="gtInput" type="password" autocomplete="off" spellcheck="false" placeholder="Dán token GoDaddy (quyền domains.domain:read)">
+                        <button type="button" class="btn-secondary" id="btnGtToggle" title="Hiện / ẩn token">👁</button>
+                        <button type="button" class="btn-secondary" id="btnGtCopy" title="Sao chép token">⧉</button>
+                    </div>
+                </div>
+                <div class="hint" id="gtSource"></div>
+                <div class="action-bar">
+                    <button class="btn-primary" id="btnGtSave" type="button">Lưu token</button>
+                    <button class="btn-secondary" id="btnGtReload" type="button">↻ Tải lại</button>
+                    <button class="btn-secondary" id="btnGtClear" type="button" title="Xóa giá trị đã lưu, quay về biến môi trường GODADDY_PAT">Xóa (về biến môi trường)</button>
+                    <span class="msg" id="gtMsg"></span>
+                </div>
+            </div>
+            <div class="card">
+                {{ gd_steps() }}
             </div>
         </div>
 
@@ -2806,6 +3038,40 @@ HTML_TEMPLATE = """
             DEV by <span>Ares</span>
         </div>
     </div>
+
+{% if not is_admin %}
+    <!-- Popup token API GoDaddy -->
+    <div id="gdTokenModal" class="modal">
+        <div class="modal-content gd-modal">
+            <span class="close-btn" onclick="closeGdToken()">&times;</span>
+            <h3>🔑 API Token GoDaddy</h3>
+            <div class="gd-alert" id="gdTokenReason" style="display:none"></div>
+            <label class="gd-opt">
+                <input type="radio" name="gdMode" value="system">
+                <span><b>Dùng token hệ thống</b> (mặc định)
+                    <small>Dùng chung với mọi người nên có thể bị GoDaddy giới hạn tốc độ khi nhiều người cùng kiểm tra.</small></span>
+            </label>
+            <label class="gd-opt">
+                <input type="radio" name="gdMode" value="personal">
+                <span><b>Dùng token cá nhân của tôi</b>
+                    <small>Token tạo từ tài khoản GoDaddy của bạn, có hạn mức riêng. Được lưu vĩnh viễn theo tài khoản, lần sau không phải nhập lại.</small></span>
+            </label>
+            <div id="gdPersonalBox">
+                <div class="form-group" style="margin-top:12px">
+                    <label for="gdTokenInput">Personal Access Token</label>
+                    <input class="field field-mono" id="gdTokenInput" type="text" autocomplete="off" spellcheck="false" placeholder="Dán token vào đây">
+                </div>
+                <div class="hint" id="gdSavedHint"></div>
+            </div>
+            <div class="msg" id="gdTokenMsg"></div>
+            <div class="gd-actions">
+                <button class="btn-primary" id="btnGdTokenSave" type="button">Lưu &amp; dùng</button>
+                <button class="btn-secondary" type="button" onclick="closeGdToken()">Đóng</button>
+            </div>
+            <div id="gdStepsBox">{{ gd_steps() }}</div>
+        </div>
+    </div>
+{% endif %}
 
     <!-- Settings Modal -->
     <div id="settingsModal" class="modal">
@@ -3180,6 +3446,7 @@ HTML_TEMPLATE = """
             if (name === 'rules' && !loaded.rules) loadRules();
             if (name === 'checkopts') loadCheckOpts();
             if (name === 'gdfixed') loadGdFixed();
+            if (name === 'gdtoken') loadGdToken();
             if (name === 'blocks' && !loaded.blocks) loadBlocks();
 {% if is_admin %}
             if (name === 'keywords' && !loaded.keywords) loadKeywordsTab();
@@ -3277,7 +3544,7 @@ HTML_TEMPLATE = """
             }
             const delay = Math.max(0, parseInt(el('gdDelay').value) || 0);
             btn.disabled = true; btnRetry.disabled = true;
-            let completed = 0;
+            let completed = 0, needTok = null;
             const total = domains.length;
             for (const domain of domains) {
                 el('gdProgress').innerHTML = '<span class="progress-dot"></span> Đang xử lý ' + (completed + 1) + '/' + total +
@@ -3302,17 +3569,110 @@ HTML_TEMPLATE = """
                         '<td><b>' + (d.price_vnd ? esc(d.price_vnd) : '—') + '</b></td>';
                     if (d.failed) { if (!gdFailed.includes(domain)) gdFailed.push(domain); }
                     else gdFailed = gdFailed.filter(x => x !== domain);
+                    if (d.need_token) needTok = d;
                 } catch (e) {
                     row.innerHTML = '<td class="domain-cell">' + esc(domain) + '</td><td colspan="4" class="error-cell">Lỗi network / quá tải — thử lại sau</td>';
                     if (!gdFailed.includes(domain)) gdFailed.push(domain);
                 }
                 completed++;
+                if (needTok) break;      // token đang bị giới hạn / lỗi: các domain còn lại cũng sẽ lỗi → dừng, chờ người dùng xử lý token
                 if (completed < total && delay > 0) await sleep(delay);
             }
-            el('gdProgress').innerHTML = '✓ Hoàn thành ' + completed + '/' + total + ' domain' +
-                (gdFailed.length ? ' · <span style="color:#f87171">' + gdFailed.length + ' lỗi</span>' : '');
+            if (needTok) {
+                domains.slice(completed).forEach(function(dm) {
+                    let r2 = el('gd-' + dm);
+                    if (!r2) { r2 = document.createElement('tr'); r2.id = 'gd-' + dm; tbody.appendChild(r2); }
+                    r2.innerHTML = '<td class="domain-cell">' + esc(dm) + '</td><td colspan="4" class="skipped">Chưa kiểm tra — cần xử lý token GoDaddy, sau đó bấm "Retry lỗi"</td>';
+                    if (!gdFailed.includes(dm)) gdFailed.push(dm);
+                });
+                el('gdProgress').innerHTML = '⚠ Đã dừng ở ' + completed + '/' + total + ' domain vì token GoDaddy bị giới hạn / lỗi' +
+                    ' · <span style="color:#f87171">' + gdFailed.length + ' chưa xong</span>';
+            } else {
+                el('gdProgress').innerHTML = '✓ Hoàn thành ' + completed + '/' + total + ' domain' +
+                    (gdFailed.length ? ' · <span style="color:#f87171">' + gdFailed.length + ' lỗi</span>' : '');
+            }
             btn.disabled = false;
             btnRetry.disabled = gdFailed.length === 0;
+            if (needTok) promptGdToken(needTok);
+        }
+
+        // ---- TOKEN API GODADDY: popup chọn token hệ thống / cá nhân (user thường) ----
+        let GD_STATE = { mode: 'system', has_personal: false, masked: '' };
+        let gdRetryAfterSave = false;
+        function updateGdStatus() {
+            const s = el('gdTokenStatus');
+            if (!s) return;
+            s.textContent = GD_STATE.mode === 'personal'
+                ? '🔑 Đang dùng token cá nhân (' + (GD_STATE.masked || '') + ')'
+                : '🔑 Đang dùng token hệ thống';
+        }
+        async function loadGdState() {
+            if (IS_ADMIN) return;
+            try { GD_STATE = await adminApi('/api/gd-token'); updateGdStatus(); } catch (e) { /* bỏ qua */ }
+        }
+        function gdReasonText(d) {
+            const personal = d.token_mode === 'personal';
+            if (d.state === 'ratelimit') return personal
+                ? 'Token cá nhân của bạn đang bị GoDaddy giới hạn tốc độ (khoảng 60 lượt/phút). Đợi khoảng 1 phút rồi bấm "Retry lỗi", hoặc đổi sang token khác.'
+                : 'GoDaddy đang giới hạn tốc độ vì quá nhiều người cùng kiểm tra bằng token hệ thống. Bạn có thể đợi một lát rồi bấm "Retry lỗi", hoặc dùng token cá nhân của mình để không bị ảnh hưởng.';
+            if (d.state === 'auth') return personal
+                ? 'Token cá nhân của bạn không hợp lệ, đã bị thu hồi hoặc thiếu quyền domains.domain:read. Hãy nhập lại token đúng.'
+                : 'Token hệ thống đang lỗi hoặc đã hết hạn. Hãy dùng token cá nhân của bạn trong lúc chờ admin xử lý.';
+            return 'Hệ thống chưa có token GoDaddy. Hãy nhập token cá nhân của bạn để tiếp tục kiểm tra giá.';
+        }
+        function promptGdToken(d) {
+            if (IS_ADMIN) {
+                if (confirm('Token GoDaddy hệ thống đang bị giới hạn / lỗi. Mở tab "API GoDaddy" để đổi token?')) showTab('gdtoken');
+                return;
+            }
+            openGdToken(gdReasonText(d), true);
+        }
+        function openGdToken(reason, retryAfter) {
+            if (IS_ADMIN || !el('gdTokenModal')) return;
+            gdRetryAfterSave = !!retryAfter;
+            const box = el('gdTokenReason');
+            box.style.display = reason ? '' : 'none';
+            box.textContent = reason || '';
+            // gặp lỗi → gợi ý sẵn "token cá nhân"; mở thủ công → hiện lựa chọn đang dùng
+            const mode = reason ? 'personal' : GD_STATE.mode;
+            document.querySelectorAll('input[name=gdMode]').forEach(function(r) { r.checked = r.value === mode; });
+            el('gdTokenInput').value = '';
+            el('gdSavedHint').textContent = GD_STATE.has_personal
+                ? 'Đã lưu token cá nhân ' + GD_STATE.masked + '. Để trống ô trên để giữ token này, hoặc dán token mới để thay.'
+                : '';
+            setMsg('gdTokenMsg', '');
+            syncGdMode();
+            el('gdTokenModal').classList.add('show');
+        }
+        function closeGdToken() { el('gdTokenModal').classList.remove('show'); }
+        function syncGdMode() {
+            const sel = document.querySelector('input[name=gdMode]:checked');
+            const show = (sel && sel.value === 'personal') ? '' : 'none';
+            el('gdPersonalBox').style.display = show;
+            el('gdStepsBox').style.display = show;
+        }
+        async function saveGdToken() {
+            const sel = document.querySelector('input[name=gdMode]:checked');
+            if (!sel) { setMsg('gdTokenMsg', 'Hãy chọn 1 trong 2 lựa chọn', false); return; }
+            const mode = sel.value, token = el('gdTokenInput').value.trim();
+            if (mode === 'personal' && !token && !GD_STATE.has_personal) {
+                setMsg('gdTokenMsg', 'Hãy dán token cá nhân vào ô nhập', false); return;
+            }
+            const b = el('btnGdTokenSave');
+            b.disabled = true;
+            setMsg('gdTokenMsg', mode === 'personal' && token ? 'Đang kiểm tra token với GoDaddy…' : 'Đang lưu…', true);
+            try {
+                const body = { mode: mode };
+                if (mode === 'personal' && token) body.token = token;
+                const d = await adminApi('/api/gd-token', body);
+                GD_STATE = d;
+                updateGdStatus();
+                closeGdToken();
+                el('gdTokenInput').value = '';
+                if (d.warning) alert(d.warning);
+                if (gdRetryAfterSave && gdFailed.length) { gdRetryAfterSave = false; startPrice(true); }
+            } catch (e) { setMsg('gdTokenMsg', e.message, false); }
+            finally { b.disabled = false; }
         }
 
         // ---- ADMIN: helper gọi API ----
@@ -3348,6 +3708,35 @@ HTML_TEMPLATE = """
                 applyAllowedOptions();
                 setMsg('aoMsg', 'Đã lưu — áp dụng cho tất cả user', true);
             } catch (e) { setMsg('aoMsg', e.message, false); }
+        }
+
+        // ---- ADMIN: token API GoDaddy hệ thống ----
+        async function loadGdToken() {
+            setMsg('gtMsg', '');
+            try {
+                const d = await adminApi('/api/admin/gd-token');
+                el('gtInput').value = d.token || '';
+                let src = d.source === 'db'
+                    ? 'Đang dùng giá trị lưu trên giao diện (ghi đè biến môi trường)'
+                    : d.source === 'env'
+                        ? 'Đang dùng biến môi trường GODADDY_PAT (chưa đặt trên giao diện)'
+                        : 'Chưa có token hệ thống nào, người dùng sẽ bị yêu cầu nhập token cá nhân';
+                if (d.updated_at && d.source === 'db') src += ' · cập nhật ' + fmtTime(d.updated_at) + (d.updated_by ? ' bởi ' + d.updated_by : '');
+                if (d.personal_users) src += ' · ' + d.personal_users + ' tài khoản đang dùng token cá nhân';
+                el('gtSource').textContent = src;
+                el('btnGtClear').disabled = d.source !== 'db';
+            } catch (e) { setMsg('gtMsg', e.message, false); }
+        }
+        async function saveGdTokenAdmin(clear) {
+            const val = clear ? '' : el('gtInput').value;
+            if (!clear && !val.trim()) { setMsg('gtMsg', 'Chưa nhập token (muốn xóa thì bấm nút "Xóa")', false); return; }
+            if (clear && !confirm('Xóa token đã lưu trên giao diện và quay về biến môi trường GODADDY_PAT?')) return;
+            setMsg('gtMsg', clear ? 'Đang xóa…' : 'Đang kiểm tra token với GoDaddy…', true);
+            try {
+                const d = await adminApi('/api/admin/gd-token', { token: val });
+                setMsg('gtMsg', clear ? 'Đã xóa — quay về biến môi trường' : ('Đã lưu — áp dụng ngay' + (d.note ? ' · ' + d.note : '')), true);
+                loadGdToken();
+            } catch (e) { setMsg('gtMsg', e.message, false); }
         }
 
         // ---- ADMIN: giá cố định GoDaddy theo đuôi ----
@@ -3517,10 +3906,25 @@ HTML_TEMPLATE = """
         // ---- khởi tạo ----
         document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => showTab(b.dataset.tab)));
         renderRulesSummary();
+        if (!IS_ADMIN) {
+            document.querySelectorAll('input[name=gdMode]').forEach(function(r) { r.addEventListener('change', syncGdMode); });
+            el('btnGdTokenSave').addEventListener('click', saveGdToken);
+            loadGdState();
+        }
         if (IS_ADMIN) {
             initBlockChips();
             el('btnAoSave').addEventListener('click', saveCheckOpts);
             el('btnGfSave').addEventListener('click', saveGdFixed);
+            el('btnGtSave').addEventListener('click', function() { saveGdTokenAdmin(false); });
+            el('btnGtClear').addEventListener('click', function() { saveGdTokenAdmin(true); });
+            el('btnGtReload').addEventListener('click', loadGdToken);
+            el('btnGtToggle').addEventListener('click', function() {
+                const i = el('gtInput'); i.type = i.type === 'password' ? 'text' : 'password';
+            });
+            el('btnGtCopy').addEventListener('click', async function() {
+                try { await navigator.clipboard.writeText(el('gtInput').value); setMsg('gtMsg', 'Đã sao chép token', true); }
+                catch (e) { setMsg('gtMsg', 'Trình duyệt không cho sao chép — hãy bấm 👁 rồi copy thủ công', false); }
+            });
             el('btnGfReload').addEventListener('click', loadGdFixed);
             el('rulesEditor').addEventListener('click', e => {
                 const b = e.target.closest('button[data-act]');
@@ -4158,8 +4562,11 @@ def api_price_check():
         domain = str(data.get("domain", "")).strip().lower().rstrip(".")
         if not DOMAIN_RE.match(domain):
             return jsonify(error="Domain không hợp lệ", failed=True), 400
-        res = check_godaddy_price(domain)
+        token, mode = resolve_gd_token(session.get("user"))
+        res = check_godaddy_price(domain, token, mode)
         res["domain"] = domain
+        res["token_mode"] = mode
+        res["need_token"] = res.get("state") in ("ratelimit", "auth", "nokey")   # → giao diện mở popup nhập token
         return jsonify(res)
     except Exception:  # noqa: BLE001
         log.exception("Lỗi kiểm tra giá %r", domain)
@@ -4167,6 +4574,116 @@ def api_price_check():
             "domain": domain or "Unknown", "state": "error", "failed": True,
             "result_html": _badge("badge-danger", "Lỗi"), "price_usd": "", "price_vat": "", "price_vnd": "",
         }), 500
+
+
+# ---------------- Token API GoDaddy: người dùng chọn hệ thống / cá nhân ----------------
+@app.route("/api/gd-token", methods=["GET"])
+@user_read_guard
+def api_gd_token_get():
+    user = session["user"]
+    if user == ADMIN_USERNAME:
+        return jsonify(is_admin=True, mode="system", has_personal=False, masked="")
+    mode, token = get_gd_user_pref(user, force=True)
+    return jsonify(mode=mode, has_personal=bool(token), masked=_gd_mask(token))
+
+
+@app.route("/api/gd-token", methods=["POST"])
+@api_guard
+def api_gd_token_save():
+    """Lưu lựa chọn của tài khoản: {"mode": "system"} hoặc {"mode": "personal", "token": "..."}.
+    Token cá nhân được lưu vĩnh viễn theo tài khoản; chuyển về "system" KHÔNG xóa token đã lưu
+    (lần sau chọn lại "personal" mà không nhập token thì dùng lại token đã lưu)."""
+    user = session["user"]
+    if user == ADMIN_USERNAME:
+        return jsonify(error="Admin dùng token hệ thống — chỉnh ở tab \"API GoDaddy\""), 400
+    db = get_db()
+    if db is None:
+        return _no_db()
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    if mode not in ("system", "personal"):
+        return jsonify(error="Lựa chọn không hợp lệ"), 400
+    warning = ""
+    upd = {"gd_mode": mode, "gd_updated_at": _now()}
+    if mode == "personal":
+        raw = data.get("token")
+        if isinstance(raw, str) and raw.strip():
+            token, err = _gd_clean_token(raw)
+            if err:
+                return jsonify(error=err), 400
+            verdict, msg = gd_test_token(token)
+            if verdict == "invalid":
+                return jsonify(error=msg), 400
+            if verdict == "unknown":
+                warning = msg
+            upd["gd_token"] = token
+        else:
+            token = get_gd_user_pref(user, force=True)[1]
+            if not token:
+                return jsonify(error="Chưa nhập token cá nhân"), 400
+    try:
+        res = db.users.update_one({"username_lower": user.lower()}, {"$set": upd})
+    except PyMongoError:
+        log.exception("Lỗi lưu token GoDaddy cá nhân của %s", user)
+        return jsonify(error="Lỗi cơ sở dữ liệu — chưa lưu được"), 503
+    if not res.matched_count:
+        return jsonify(error="Tài khoản này không lưu trong cơ sở dữ liệu nên chưa lưu được token cá nhân"), 400
+    _invalidate_gd_token_cache()
+    new_mode, new_token = get_gd_user_pref(user, force=True)
+    log.info("User %s chọn token GoDaddy: %s", user, new_mode)
+    return jsonify(ok=True, mode=new_mode, has_personal=bool(new_token), masked=_gd_mask(new_token), warning=warning)
+
+
+# ---------------- ADMIN: token API GoDaddy hệ thống ----------------
+@app.route("/api/admin/gd-token", methods=["GET"])
+@admin_guard
+def api_admin_gd_token():
+    token, source = get_gd_system_token(force=True)
+    doc, personal = {}, 0
+    db = get_db()
+    if db is not None:
+        try:
+            doc = db.app_settings.find_one({"_id": _GD_SYS_ID}) or {}
+            personal = db.users.count_documents({"gd_mode": "personal", "gd_token": {"$exists": True, "$ne": ""}})
+        except PyMongoError:
+            log.exception("Lỗi đọc cài đặt token GoDaddy")
+    return jsonify(token=token, source=source, env_set=bool(GODADDY_PAT),
+                   updated_at=_iso(doc.get("updated_at")), updated_by=doc.get("updated_by"),
+                   personal_users=personal)
+
+
+@app.route("/api/admin/gd-token", methods=["POST"])
+@admin_guard
+def api_admin_gd_token_save():
+    """Đặt token hệ thống mới; để trống = xóa giá trị đã lưu và quay về biến môi trường GODADDY_PAT."""
+    db = get_db()
+    if db is None:
+        return _no_db()
+    raw = (request.get_json(silent=True) or {}).get("token")
+    if not isinstance(raw, str):
+        return jsonify(error="Dữ liệu không hợp lệ"), 400
+    note = ""
+    try:
+        if not raw.strip():
+            db.app_settings.delete_one({"_id": _GD_SYS_ID})
+            log.info("Admin %s xóa token GoDaddy hệ thống (quay về biến môi trường)", session["user"])
+        else:
+            token, err = _gd_clean_token(raw)
+            if err:
+                return jsonify(error=err), 400
+            verdict, note = gd_test_token(token)
+            if verdict == "invalid":
+                return jsonify(error=note), 400
+            db.app_settings.update_one(
+                {"_id": _GD_SYS_ID},
+                {"$set": {"token": token, "updated_at": _now(), "updated_by": session["user"]}}, upsert=True)
+            log.info("Admin %s cập nhật token GoDaddy hệ thống", session["user"])
+    except PyMongoError:
+        log.exception("Lỗi lưu token GoDaddy hệ thống")
+        return jsonify(error="Lỗi cơ sở dữ liệu — chưa lưu được"), 503
+    _invalidate_gd_token_cache()
+    token, source = get_gd_system_token(force=True)
+    return jsonify(ok=True, token=token, source=source, env_set=bool(GODADDY_PAT), note=note)
 
 
 # ---------------- ADMIN: giá cố định GoDaddy theo đuôi ----------------
@@ -5400,7 +5917,7 @@ def output_step2_text(result: Dict) -> str:
 
     return "\n".join(lines)
 
-DEFAULT_TRC20_WALLET = "TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k"
+DEFAULT_TRC20_WALLET = "TRBfqJLUy84t6YvnPGFnju4HnRqgaigZvK"
 
 def clean_wallet(value) -> str:
     """Chuẩn hóa địa chỉ ví từ ô input: bỏ khoảng trắng/xuống dòng, giới hạn độ dài; rỗng → ví mặc định."""
@@ -6096,7 +6613,7 @@ CART_HTML_PAGE = r"""<!DOCTYPE html>
       <input type="text" id="customMention" placeholder="@custom..." disabled />
       <label class="field" for="walletInput">Ví TRC20</label>
       <input type="text" id="walletInput" placeholder="Địa chỉ ví TRC20" autocomplete="off" spellcheck="false"
-             value="TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
+             value="TRBfqJLUy84t6YvnPGFnju4HnRqgaigZvK" title="Tự lưu, giữ nguyên cho tới khi bạn đổi" />
       <button class="btn btn-violet" data-cmd="step1">🔍 Lọc</button>
       <button class="btn btn-green" data-cmd="1">💡 Đề xuất</button>
       <button class="btn btn-slate" id="btnHistory" title="Xem lại các đơn đã đề xuất trong 1 giờ qua">🕘 Lịch sử</button>
@@ -6199,7 +6716,7 @@ let ignoreBanned = false;   // bấm "Bỏ qua" → vẫn mua domain cấm trong
 $("#cart").addEventListener("input", () => { ignoreBanned = false; });
 $("#original").addEventListener("input", () => { ignoreBanned = false; });
 
-const DEFAULT_WALLET = "TFVgiapmsxVjQYNwPgLA9xrFS5bAxFNZ2k";
+const DEFAULT_WALLET = "TRBfqJLUy84t6YvnPGFnju4HnRqgaigZvK";
 const WALLET_KEY = "cart_checker_trc20_wallet";
 (function initWallet() {
   const el = $("#walletInput");
