@@ -1512,6 +1512,7 @@ def _gd_throttle(st):
 
 # ---- Token API GoDaddy: hệ thống (admin xem/sửa trên giao diện) + cá nhân (lưu theo tài khoản) ----
 _GD_SYS_ID = "gd_system_token"            # app_settings: token hệ thống do admin đặt (ghi đè biến môi trường)
+_GD_USER_PREFIX = "gd_user:"              # app_settings: lựa chọn token của từng tài khoản (mọi nguồn: env hoặc MongoDB)
 _GD_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+/=-]{16,2000}$")
 GD_TOKEN_TTL = 10
 _gd_sys_cache = {"ts": -1e9, "val": ""}
@@ -1533,6 +1534,10 @@ def _gd_clean_token(raw):
     if not _GD_TOKEN_RE.match(t):
         return "", "Token không hợp lệ (16–2000 ký tự, không chứa khoảng trắng hay ký tự lạ)"
     return t, None
+
+
+def _gd_user_id(username):
+    return _GD_USER_PREFIX + (username or "").lower()
 
 
 def _gd_mask(token):
@@ -1574,7 +1579,9 @@ def get_gd_user_pref(username, force=False):
     db = get_db()
     if db is not None:
         try:
-            doc = db.users.find_one({"username_lower": key}, {"gd_mode": 1, "gd_token": 1}) or {}
+            doc = db.app_settings.find_one({"_id": _gd_user_id(username)})
+            if doc is None:       # bản cũ từng lưu thẳng vào users → vẫn đọc được
+                doc = db.users.find_one({"username_lower": key}, {"gd_mode": 1, "gd_token": 1}) or {}
             token = str(doc.get("gd_token") or "").strip()
             mode = "personal" if (doc.get("gd_mode") == "personal" and token) else "system"
         except PyMongoError as e:
@@ -4622,12 +4629,20 @@ def api_gd_token_save():
             if not token:
                 return jsonify(error="Chưa nhập token cá nhân"), 400
     try:
-        res = db.users.update_one({"username_lower": user.lower()}, {"$set": upd})
+        # upsert theo tên tài khoản: tài khoản khai báo trong biến môi trường (không có trong collection users) cũng lưu được
+        if mode == "system" and "gd_token" not in upd:
+            old = db.app_settings.find_one({"_id": _gd_user_id(user)}) is None
+            if old:      # chưa có bản ghi mới: chuyển token cũ (nếu có) sang để không mất khi đổi lựa chọn
+                legacy = db.users.find_one({"username_lower": user.lower()}, {"gd_token": 1}) or {}
+                if legacy.get("gd_token"):
+                    upd["gd_token"] = legacy["gd_token"]
+        elif mode == "personal" and "gd_token" not in upd:
+            upd["gd_token"] = token       # dùng lại token đã lưu (đọc ở trên, có thể từ bản ghi cũ)
+        upd["username"] = user
+        db.app_settings.update_one({"_id": _gd_user_id(user)}, {"$set": upd}, upsert=True)
     except PyMongoError:
         log.exception("Lỗi lưu token GoDaddy cá nhân của %s", user)
         return jsonify(error="Lỗi cơ sở dữ liệu — chưa lưu được"), 503
-    if not res.matched_count:
-        return jsonify(error="Tài khoản này không lưu trong cơ sở dữ liệu nên chưa lưu được token cá nhân"), 400
     _invalidate_gd_token_cache()
     new_mode, new_token = get_gd_user_pref(user, force=True)
     log.info("User %s chọn token GoDaddy: %s", user, new_mode)
@@ -4644,7 +4659,8 @@ def api_admin_gd_token():
     if db is not None:
         try:
             doc = db.app_settings.find_one({"_id": _GD_SYS_ID}) or {}
-            personal = db.users.count_documents({"gd_mode": "personal", "gd_token": {"$exists": True, "$ne": ""}})
+            personal = db.app_settings.count_documents(
+                {"_id": {"$regex": "^" + _GD_USER_PREFIX}, "gd_mode": "personal", "gd_token": {"$exists": True, "$ne": ""}})
         except PyMongoError:
             log.exception("Lỗi đọc cài đặt token GoDaddy")
     return jsonify(token=token, source=source, env_set=bool(GODADDY_PAT),
@@ -4828,6 +4844,11 @@ def api_admin_user_delete():
     if not res.deleted_count:
         return jsonify(error="Không tìm thấy tài khoản"), 404
     _clear_user_cache()
+    try:
+        db.app_settings.delete_one({"_id": _gd_user_id(target)})      # xóa luôn token GoDaddy cá nhân của tài khoản
+        _invalidate_gd_token_cache()
+    except PyMongoError:
+        log.exception("Không xóa được token GoDaddy cá nhân của %s", target)
     log.info("Admin %s xóa tài khoản %s", session["user"], target)
     return jsonify(ok=True)
 
